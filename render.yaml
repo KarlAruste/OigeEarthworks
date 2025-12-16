@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: earthworks-app
+    name: earthworks-app-eu
     env: python
     region: frankfurt
     plan: free
