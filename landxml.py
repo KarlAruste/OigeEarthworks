@@ -19,13 +19,78 @@ def _read_points_xyz(root):
             pass
     return np.array(pts, dtype=float) if pts else None
 
+
+def _compute_profile_area_edge_topline(tt, zz, edge_tail_pct=10.0, edge_z_pct=95.0, min_width=0.8):
+    """
+    Edge-based topline:
+    - left edge points = lowest tail in t
+    - right edge points = highest tail in t
+    - zL/zR = high percentile of edge points (NOT median) to catch 'edge crest'
+    - topline = line between (tL,zL) and (tR,zR)
+    """
+    # sort by t for integration
+    order = np.argsort(tt)
+    tt_s = tt[order]
+    zz_s = zz[order]
+
+    width = float(tt_s.max() - tt_s.min())
+    if width < min_width:
+        return None
+
+    left_thr = np.percentile(tt_s, edge_tail_pct)
+    right_thr = np.percentile(tt_s, 100.0 - edge_tail_pct)
+
+    left = tt_s <= left_thr
+    right = tt_s >= right_thr
+
+    if left.sum() < 8 or right.sum() < 8:
+        return None
+
+    # edge locations (t) as robust median
+    tL = float(np.median(tt_s[left]))
+    tR = float(np.median(tt_s[right]))
+    if abs(tR - tL) < 0.5:
+        return None
+
+    # KEY CHANGE: edge Z is high percentile (or max) to represent top edge
+    zL = float(np.percentile(zz_s[left], edge_z_pct))
+    zR = float(np.percentile(zz_s[right], edge_z_pct))
+
+    topline = zL + (zR - zL) * ((tt_s - tL) / (tR - tL))
+    depth = np.maximum(0.0, topline - zz_s)
+
+    area = float(np.trapz(depth, tt_s))
+    return area if area > 0 else None
+
+
+def _compute_profile_area_top_percentile(tt, zz, top_percentile=95.0, min_width=0.8):
+    """
+    Fallback:
+    - assume top plane is high percentile of z in the slice
+    """
+    order = np.argsort(tt)
+    tt_s = tt[order]
+    zz_s = zz[order]
+
+    width = float(tt_s.max() - tt_s.min())
+    if width < min_width:
+        return None
+
+    z_top = float(np.percentile(zz_s, top_percentile))
+    depth = np.maximum(0.0, z_top - zz_s)
+    area = float(np.trapz(depth, tt_s))
+    return area if area > 0 else None
+
+
 def _solve_from_points(
     pts: np.ndarray,
     n_bins: int,
     slice_thickness_ratio: float,
     edge_tail_pct: float,
+    edge_z_pct: float,
+    top_percentile_fallback: float,
     trim_inner_pct: float = 1.0,
-    min_points_per_slice: int = 120,
+    min_points_per_slice: int = 60,
 ):
     XY = pts[:, :2]
     Z = pts[:, 2]
@@ -48,7 +113,7 @@ def _solve_from_points(
     centers = np.linspace(s_min, s_max, n_bins)
 
     areas = []
-    valid_slices = 0
+    valid = 0
 
     for c in centers:
         mask = np.abs(s - c) <= thick
@@ -58,70 +123,53 @@ def _solve_from_points(
         tt = t[mask]
         zz = Z[mask]
 
-        # trim outliers in t
+        # trim extreme t outliers to stabilize edges
         t_lo = np.percentile(tt, trim_inner_pct)
         t_hi = np.percentile(tt, 100.0 - trim_inner_pct)
         m2 = (tt >= t_lo) & (tt <= t_hi)
         tt = tt[m2]
         zz = zz[m2]
+
         if len(tt) < min_points_per_slice:
             continue
 
-        left_thr = np.percentile(tt, edge_tail_pct)
-        right_thr = np.percentile(tt, 100.0 - edge_tail_pct)
+        # Try edge-topline first
+        area = _compute_profile_area_edge_topline(
+            tt, zz,
+            edge_tail_pct=edge_tail_pct,
+            edge_z_pct=edge_z_pct,
+        )
 
-        left = (tt <= left_thr)
-        right = (tt >= right_thr)
-        if left.sum() < 10 or right.sum() < 10:
-            continue
+        # Fallback to top-percentile if needed
+        if area is None:
+            area = _compute_profile_area_top_percentile(
+                tt, zz,
+                top_percentile=top_percentile_fallback,
+            )
 
-        tL = float(np.median(tt[left]))
-        zL = float(np.median(zz[left]))
-        tR = float(np.median(tt[right]))
-        zR = float(np.median(zz[right]))
-        if abs(tR - tL) < 0.5:
-            continue
-
-        order = np.argsort(tt)
-        tt_s = tt[order]
-        zz_s = zz[order]
-
-        top_line = zL + (zR - zL) * ((tt_s - tL) / (tR - tL))
-        depth = np.maximum(0.0, top_line - zz_s)
-
-        width = float(tt_s.max() - tt_s.min())
-        if width < 0.8:
-            continue
-
-        area = float(np.trapz(depth, tt_s))
-        if area > 0:
+        if area is not None:
             areas.append(area)
-            valid_slices += 1
+            valid += 1
 
     if not areas:
-        return {"length": float(length), "mean_area": None, "volume": None, "valid_slices": valid_slices}
+        return {"length": float(length), "mean_area": None, "volume": None, "valid_slices": valid}
 
     mean_area = float(np.mean(areas))
     volume = float(float(length) * mean_area)
+    return {"length": float(length), "mean_area": mean_area, "volume": volume, "valid_slices": valid}
 
-    return {
-        "length": float(length),
-        "mean_area": mean_area,
-        "volume": volume,
-        "valid_slices": valid_slices
-    }
 
 def estimate_length_area_volume_from_tin(
     xml_bytes: bytes,
-    n_bins: int = 30,
-    slice_thickness_ratio: float = 0.03,
+    n_bins: int = 40,
+    slice_thickness_ratio: float = 0.04,
     edge_tail_pct: float = 10.0,
+    edge_z_pct: float = 97.0,             # NEW: use high percentile on edge points
+    top_percentile_fallback: float = 95.0 # fallback plane
 ):
     """
-    Auto-detect:
-    - Try points as (X,Y,Z)
-    - Try swapped as (Y,X,Z)
-    Choose result with more valid slices, then with non-null volume.
+    Returns (length_m, mean_area_m2, volume_m3).
+    Tries XY and swapped YX; chooses best by valid slices and non-null volume.
     """
     try:
         root = ET.fromstring(xml_bytes)
@@ -129,19 +177,22 @@ def estimate_length_area_volume_from_tin(
         return None, None, None
 
     pts = _read_points_xyz(root)
-    if pts is None or len(pts) < 500:
+    if pts is None or len(pts) < 300:
         return None, None, None
 
-    res_xy = _solve_from_points(pts, n_bins, slice_thickness_ratio, edge_tail_pct)
+    res_xy = _solve_from_points(
+        pts, n_bins, slice_thickness_ratio,
+        edge_tail_pct, edge_z_pct, top_percentile_fallback
+    )
+
     pts_swapped = pts.copy()
     pts_swapped[:, 0], pts_swapped[:, 1] = pts[:, 1], pts[:, 0]
-    res_yx = _solve_from_points(pts_swapped, n_bins, slice_thickness_ratio, edge_tail_pct)
+    res_yx = _solve_from_points(
+        pts_swapped, n_bins, slice_thickness_ratio,
+        edge_tail_pct, edge_z_pct, top_percentile_fallback
+    )
 
-    candidates = [r for r in [res_xy, res_yx] if r is not None]
-    if not candidates:
-        return None, None, None
-
-    # choose best: more valid slices; prefer with volume
+    candidates = [res_xy, res_yx]
     candidates.sort(key=lambda r: (r["valid_slices"], r["volume"] is not None), reverse=True)
     best = candidates[0]
 
