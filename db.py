@@ -86,17 +86,18 @@ def init_db():
         PRIMARY KEY(task_id, depends_on_task_id)
     );
     """
+
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(ddl)
 
-            # --- migrations (safe) ---
+            # migrations / new columns
             cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS planned_volume_m3 NUMERIC(14,3)")
-            cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS landxml_key TEXT")
-            cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS sort_order INT NOT NULL DEFAULT 0")
             cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS planned_length_m NUMERIC(14,3)")
             cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS planned_area_m2 NUMERIC(14,3)")
+            cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS landxml_key TEXT")
 
+            cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS sort_order INT NOT NULL DEFAULT 0")
 
             cur.execute("""
             CREATE TABLE IF NOT EXISTS weekly_plan (
@@ -108,11 +109,16 @@ def init_db():
                 created_at TIMESTAMP NOT NULL DEFAULT NOW()
             );
             """)
+
         conn.commit()
 
 # ---------- Projects ----------
 def create_project(name: str, start_date=None, end_date=None):
-    q = "INSERT INTO projects(name, start_date, end_date) VALUES(%s,%s,%s) RETURNING id"
+    q = """
+    INSERT INTO projects(name, start_date, end_date)
+    VALUES(%s,%s,%s)
+    RETURNING id
+    """
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(q, (name, start_date, end_date))
@@ -122,7 +128,8 @@ def create_project(name: str, start_date=None, end_date=None):
 
 def list_projects():
     q = """
-    SELECT id, name, start_date, end_date, status, planned_volume_m3, planned_length_m, planned_area_m2, landxml_key
+    SELECT id, name, start_date, end_date, status,
+           planned_volume_m3, planned_length_m, planned_area_m2, landxml_key
     FROM projects
     ORDER BY name
     """
@@ -133,7 +140,8 @@ def list_projects():
 
 def get_project(project_id: int):
     q = """
-    SELECT id, name, start_date, end_date, status, planned_volume_m3, planned_length_m, planned_area_m2, landxml_key
+    SELECT id, name, start_date, end_date, status,
+           planned_volume_m3, planned_length_m, planned_area_m2, landxml_key
     FROM projects
     WHERE id=%s
     """
@@ -156,7 +164,6 @@ def set_project_landxml(project_id: int, landxml_key: str, planned_volume_m3, pl
         with conn.cursor() as cur:
             cur.execute(q, (landxml_key, planned_volume_m3, planned_length_m, planned_area_m2, project_id))
         conn.commit()
-
 
 # ---------- Cost items ----------
 def list_cost_items():
@@ -212,10 +219,10 @@ def list_workers(active_only=True):
             cur.execute(q)
             return [dict(r) for r in cur.fetchall()]
 
-# ---------- Assignments (double booking check) ----------
+# ---------- Assignments ----------
 def add_assignment(worker_id, project_id, start_date, end_date, note=""):
     if end_date < start_date:
-        raise ValueError("End date must be >= start date")
+        raise ValueError("Lõppkuupäev peab olema >= alguskuupäev")
 
     overlap_q = """
     SELECT 1 FROM assignments
@@ -232,32 +239,46 @@ def add_assignment(worker_id, project_id, start_date, end_date, note=""):
         with conn.cursor() as cur:
             cur.execute(overlap_q, (worker_id, start_date, end_date))
             if cur.fetchone():
-                raise ValueError("Worker is already assigned in this date range.")
+                raise ValueError("Töötaja on juba broneeritud selles ajavahemikus.")
             cur.execute(insert_q, (worker_id, project_id, start_date, end_date, note))
         conn.commit()
 
-def list_assignments():
-    q = """
-    SELECT a.id, w.name AS worker_name, p.name AS project_name, a.start_date, a.end_date, a.note
-    FROM assignments a
-    JOIN workers w ON w.id=a.worker_id
-    JOIN projects p ON p.id=a.project_id
-    ORDER BY a.start_date DESC, w.name
-    """
+def list_assignments(project_id=None):
+    if project_id:
+        q = """
+        SELECT a.id, w.name AS worker_name, p.name AS project_name, a.start_date, a.end_date, a.note
+        FROM assignments a
+        JOIN workers w ON w.id=a.worker_id
+        JOIN projects p ON p.id=a.project_id
+        WHERE a.project_id=%s
+        ORDER BY a.start_date DESC, w.name
+        """
+        params = (project_id,)
+    else:
+        q = """
+        SELECT a.id, w.name AS worker_name, p.name AS project_name, a.start_date, a.end_date, a.note
+        FROM assignments a
+        JOIN workers w ON w.id=a.worker_id
+        JOIN projects p ON p.id=a.project_id
+        ORDER BY a.start_date DESC, w.name
+        """
+        params = ()
+
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-            cur.execute(q)
+            cur.execute(q, params)
             return [dict(r) for r in cur.fetchall()]
 
-# ---------- Tasks + dependencies ----------
-def add_task(project_id, name, start_date=None, end_date=None, sort_order=0):
+# ---------- Tasks ----------
+def add_task(project_id, name, start_date=None, end_date=None):
     q = """
-    INSERT INTO tasks(project_id, name, start_date, end_date, sort_order)
-    VALUES(%s,%s,%s,%s,%s) RETURNING id
+    INSERT INTO tasks(project_id, name, start_date, end_date)
+    VALUES(%s,%s,%s,%s)
+    RETURNING id
     """
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(q, (project_id, name, start_date, end_date, sort_order))
+            cur.execute(q, (project_id, name, start_date, end_date))
             tid = cur.fetchone()[0]
         conn.commit()
     return tid
@@ -289,7 +310,6 @@ def task_is_blocked(task_id):
             return cur.fetchone() is not None
 
 def list_tasks(project_id):
-    # higher sort_order => later work. We'll show DESC so top is last.
     q = """
     SELECT id, name, start_date, end_date, status, sort_order
     FROM tasks
@@ -306,7 +326,7 @@ def list_tasks(project_id):
 
 def set_task_status(task_id, new_status):
     if new_status in ("in_progress", "done") and task_is_blocked(task_id):
-        raise ValueError("Task is blocked by prerequisites.")
+        raise ValueError("Ei saa alustada: eeldustööd on tegemata.")
     with get_conn() as conn:
         with conn.cursor() as cur:
             if new_status == "done":
@@ -315,14 +335,7 @@ def set_task_status(task_id, new_status):
                 cur.execute("UPDATE tasks SET status=%s WHERE id=%s", (new_status, task_id))
         conn.commit()
 
-def bump_task_order(task_id: int, delta: int):
-    q = "UPDATE tasks SET sort_order = sort_order + %s WHERE id=%s"
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(q, (delta, task_id))
-        conn.commit()
-
-# ---------- Reports: daily profit series ----------
+# ---------- Reports ----------
 def daily_profit_series(project_id):
     q = """
     WITH
