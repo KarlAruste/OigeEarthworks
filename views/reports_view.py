@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 from datetime import date
 from db import list_projects, list_cost_items, add_cost_item, add_production, add_revenue, daily_profit_series
 
-def render_reports_page():
+def render_reports_view():
     st.title("Reports: kasum/kaotus graafikud")
 
     projects = list_projects()
@@ -12,11 +12,12 @@ def render_reports_page():
         st.info("Loo enne projekt (Projects lehel).")
         return
 
-    p_map = {p["name"]: p for p in projects}
-    proj_name = st.selectbox("Vali projekt", list(p_map.keys()))
-    p = p_map[proj_name]
-    project_id = p["id"]
-
+    project_id = st.selectbox(
+        "Vali projekt",
+        options=[p["id"] for p in projects],
+        format_func=lambda pid: next(x["name"] for x in projects if x["id"] == pid),
+    )
+    p = next(x for x in projects if x["id"] == project_id)
     st.caption(f"Projekt tähtaeg: **{p.get('end_date')}**")
 
     st.markdown('<div class="block">', unsafe_allow_html=True)
@@ -27,6 +28,7 @@ def render_reports_page():
         unit = st.text_input("Ühik", placeholder="m3 / m2 / h")
     with c2:
         price = st.number_input("Ühiku hind", min_value=0.0, value=0.0, step=0.5)
+
     if st.button("Lisa hinnakirja", use_container_width=True):
         if ci_name.strip() and unit.strip():
             add_cost_item(ci_name.strip(), unit.strip(), price)
@@ -43,13 +45,20 @@ def render_reports_page():
 
     st.markdown('<div class="block">', unsafe_allow_html=True)
     st.subheader("Lisa kulu (tehtud töö)")
-    ci_map = {f"{c['name']} ({c['unit']}, {c['unit_price']}€)": c["id"] for c in cost_items}
-    ci_label = st.selectbox("Vali cost item", list(ci_map.keys()))
+    cost_item_id = st.selectbox(
+        "Töö",
+        options=[c["id"] for c in cost_items],
+        format_func=lambda cid: next(x["name"] for x in cost_items if x["id"] == cid),
+    )
+    chosen = next(x for x in cost_items if x["id"] == cost_item_id)
+    st.caption(f"Ühik: {chosen['unit']} • Hind: {float(chosen['unit_price']):.2f} €/ühik")
+
     qty = st.number_input("Kogus", min_value=0.0, value=0.0, step=1.0)
     work_date = st.date_input("Kuupäev", value=date.today(), key="work_date")
     note = st.text_input("Märkus", key="work_note")
+
     if st.button("Salvesta kulu", use_container_width=True):
-        add_production(project_id, ci_map[ci_label], qty, work_date, note)
+        add_production(project_id, cost_item_id, qty, work_date, note)
         st.success("Kulu salvestatud.")
         st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
@@ -59,6 +68,7 @@ def render_reports_page():
     amount = st.number_input("Summa €", min_value=0.0, value=0.0, step=10.0)
     rev_date = st.date_input("Kuupäev", value=date.today(), key="rev_date")
     rev_note = st.text_input("Märkus", key="rev_note")
+
     if st.button("Salvesta tulu", use_container_width=True):
         add_revenue(project_id, amount, rev_date, rev_note)
         st.success("Tulu salvestatud.")
