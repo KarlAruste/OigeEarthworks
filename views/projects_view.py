@@ -111,11 +111,12 @@ def render_projects_view():
             xml_bytes = download_bytes(s3, key)
 
             length_m, area_m2, vol_m3 = estimate_length_area_volume_from_tin(
-                xml_bytes,
-                n_bins=int(n_bins),
-                slice_thickness_ratio=float(slice_ratio),
-                edge_tail_pct=float(edge_tail),
-            )
+            xml_bytes,
+            n_bins=int(n_bins),
+            slice_thickness_ratio=float(slice_ratio),
+            edge_tail_pct=float(edge_tail),
+        )
+
 
             set_project_landxml(p["id"], key, vol_m3, length_m, area_m2)
 
