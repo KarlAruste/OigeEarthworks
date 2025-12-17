@@ -103,6 +103,8 @@ def render_projects_view():
             n_bins = st.slider("Lõigete arv", min_value=10, max_value=120, value=30, step=5)
             edge_tail = st.slider("Serva tail %", min_value=5, max_value=25, value=10, step=1)
             slice_ratio = st.slider("Slice paksus (ratio %)", min_value=1, max_value=10, value=3, step=1) / 100.0
+            edge_z_pct = st.slider("Serva Z percentiil (kõrgus)", 90, 99, 97, 1)
+            fallback_top = st.slider("Fallback top %", 85, 99, 95, 1)
 
         if landxml and st.button("Salvesta & arvuta", use_container_width=True):
             prefix = project_prefix(p["name"]) + "landxml/"
@@ -115,7 +117,10 @@ def render_projects_view():
             n_bins=int(n_bins),
             slice_thickness_ratio=float(slice_ratio),
             edge_tail_pct=float(edge_tail),
-        )
+            edge_z_pct=float(edge_z_pct),
+            top_percentile_fallback=float(fallback_top),
+         )
+
 
 
             set_project_landxml(p["id"], key, vol_m3, length_m, area_m2)
