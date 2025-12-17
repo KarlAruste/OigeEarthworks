@@ -1,9 +1,9 @@
 import streamlit as st
 from db import init_db
-from pages.projects_page import render_projects_page
-from pages.workers_page import render_workers_page
-from pages.tasks_page import render_tasks_page
-from pages.reports_page import render_reports_page
+from views.projects_page import render_projects_page
+from views.workers_page import render_workers_page
+from views.tasks_page import render_tasks_page
+from views.reports_page import render_reports_page
 
 st.set_page_config(page_title="Earthworks App", layout="wide")
 
