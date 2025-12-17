@@ -89,6 +89,22 @@ def init_db():
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(ddl)
+
+            # --- migrations (safe) ---
+            cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS planned_volume_m3 NUMERIC(14,3)")
+            cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS landxml_key TEXT")
+            cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS sort_order INT NOT NULL DEFAULT 0")
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS weekly_plan (
+                id SERIAL PRIMARY KEY,
+                project_id INT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                task_id INT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                week_start DATE NOT NULL,
+                note TEXT,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            );
+            """)
         conn.commit()
 
 # ---------- Projects ----------
@@ -102,11 +118,22 @@ def create_project(name: str, start_date=None, end_date=None):
     return pid
 
 def list_projects():
-    q = "SELECT id, name, start_date, end_date, status FROM projects ORDER BY name"
+    q = """
+    SELECT id, name, start_date, end_date, status, planned_volume_m3, landxml_key
+    FROM projects
+    ORDER BY name
+    """
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
             cur.execute(q)
             return [dict(r) for r in cur.fetchall()]
+
+def set_project_landxml(project_id: int, landxml_key: str, planned_volume_m3):
+    q = "UPDATE projects SET landxml_key=%s, planned_volume_m3=%s WHERE id=%s"
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(q, (landxml_key, planned_volume_m3, project_id))
+        conn.commit()
 
 # ---------- Cost items ----------
 def list_cost_items():
@@ -200,11 +227,14 @@ def list_assignments():
             return [dict(r) for r in cur.fetchall()]
 
 # ---------- Tasks + dependencies ----------
-def add_task(project_id, name, start_date=None, end_date=None):
-    q = "INSERT INTO tasks(project_id, name, start_date, end_date) VALUES(%s,%s,%s,%s) RETURNING id"
+def add_task(project_id, name, start_date=None, end_date=None, sort_order=0):
+    q = """
+    INSERT INTO tasks(project_id, name, start_date, end_date, sort_order)
+    VALUES(%s,%s,%s,%s,%s) RETURNING id
+    """
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(q, (project_id, name, start_date, end_date))
+            cur.execute(q, (project_id, name, start_date, end_date, sort_order))
             tid = cur.fetchone()[0]
         conn.commit()
     return tid
@@ -236,11 +266,12 @@ def task_is_blocked(task_id):
             return cur.fetchone() is not None
 
 def list_tasks(project_id):
+    # higher sort_order => later work. We'll show DESC so top is last.
     q = """
-    SELECT id, name, start_date, end_date, status
+    SELECT id, name, start_date, end_date, status, sort_order
     FROM tasks
     WHERE project_id=%s
-    ORDER BY COALESCE(start_date, '1900-01-01'::date), id
+    ORDER BY sort_order DESC, id DESC
     """
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
@@ -256,53 +287,4 @@ def set_task_status(task_id, new_status):
     with get_conn() as conn:
         with conn.cursor() as cur:
             if new_status == "done":
-                cur.execute("UPDATE tasks SET status=%s, completed_at=NOW() WHERE id=%s", (new_status, task_id))
-            else:
-                cur.execute("UPDATE tasks SET status=%s WHERE id=%s", (new_status, task_id))
-        conn.commit()
-
-# ---------- Reports: daily profit series ----------
-def daily_profit_series(project_id):
-    q = """
-    WITH
-    costs AS (
-        SELECT work_date AS d, SUM(qty * ci.unit_price)::numeric(14,2) AS cost
-        FROM production_entries pe
-        JOIN cost_items ci ON ci.id = pe.cost_item_id
-        WHERE pe.project_id=%s
-        GROUP BY work_date
-    ),
-    rev AS (
-        SELECT rev_date AS d, SUM(amount)::numeric(14,2) AS revenue
-        FROM revenue_entries
-        WHERE project_id=%s
-        GROUP BY rev_date
-    ),
-    bounds AS (
-        SELECT
-          LEAST(
-            COALESCE((SELECT MIN(d) FROM costs), CURRENT_DATE),
-            COALESCE((SELECT MIN(d) FROM rev), CURRENT_DATE)
-          ) AS dmin,
-          GREATEST(
-            COALESCE((SELECT MAX(d) FROM costs), CURRENT_DATE),
-            COALESCE((SELECT MAX(d) FROM rev), CURRENT_DATE)
-          ) AS dmax
-    ),
-    days AS (
-        SELECT generate_series((SELECT dmin FROM bounds), (SELECT dmax FROM bounds), interval '1 day')::date AS d
-    )
-    SELECT
-      days.d AS date,
-      COALESCE(rev.revenue, 0)::numeric(14,2) AS revenue,
-      COALESCE(costs.cost, 0)::numeric(14,2) AS cost,
-      (COALESCE(rev.revenue, 0) - COALESCE(costs.cost, 0))::numeric(14,2) AS profit
-    FROM days
-    LEFT JOIN rev ON rev.d = days.d
-    LEFT JOIN costs ON costs.d = days.d
-    ORDER BY days.d;
-    """
-    with get_conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-            cur.execute(q, (project_id, project_id))
-            return [dict(r) for r in cur.fetchall()]
+                cur.execute("UPDATE tasks SE
