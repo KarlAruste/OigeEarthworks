@@ -1,5 +1,6 @@
 streamlit
-pandas
-openpyxl
-numpy
 boto3
+botocore
+psycopg2-binary
+pandas
+matplotlib
