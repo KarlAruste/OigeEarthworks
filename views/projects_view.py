@@ -131,7 +131,7 @@ def render_projects_view():
                    "See tähendab tavaliselt, et servad pole selles pinnas või TIN on ainult kraavi põhi.")
     else:
         st.warning("TIN-ist ei suutnud kindlalt ristlõiget/mahtu hinnata. Fail salvestati.")
-                )
+ 
             else:
                 st.success(
                     f"Leitud: pikkus ~ {length_m:.2f} m, ristlõige ~ {area_m2:.2f} m², maht ~ {vol_m3:.1f} m³"
