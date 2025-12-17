@@ -1,8 +1,9 @@
 import streamlit as st
 from datetime import date
+
 from db import list_projects, create_project, get_project, set_project_landxml
 from r2 import get_s3, project_prefix, ensure_project_marker, list_files, upload_file, download_bytes, delete_key
-from landxml import parse_landxml_total_volume
+from landxml import estimate_length_area_volume_from_tin
 
 def render_projects_view():
     st.title("Projects")
@@ -62,28 +63,52 @@ def render_projects_view():
         st.subheader(p["name"])
         st.caption(f"Tähtaeg: {p.get('end_date')}")
 
-        # Planned volume (from LandXML)
-        planned = p.get("planned_volume_m3")
-        if planned is not None:
-            st.success(f"Planeeritud maht (LandXML): {float(planned):.2f} m³")
-        else:
+        # Planned geometry summary
+        length = p.get("planned_length_m")
+        area = p.get("planned_area_m2")
+        vol = p.get("planned_volume_m3")
+
+        if length is not None:
+            st.write(f"**Pikkus:** {float(length):.2f} m")
+        if area is not None:
+            st.write(f"**Keskmine ristlõige:** {float(area):.2f} m²")
+        if vol is not None:
+            st.write(f"**Planeeritud maht:** {float(vol):.1f} m³")
+
+        if vol is None:
             st.info("Planeeritud maht puudub. Laadi LandXML üles.")
 
         # --- LandXML upload ---
         st.markdown('<div class="block">', unsafe_allow_html=True)
-        st.subheader("📄 LandXML (planeeritud mahu arvutus)")
-        landxml = st.file_uploader("Laadi üles LandXML (.xml)", type=["xml"])
-        if landxml and st.button("Salvesta LandXML", use_container_width=True):
+        st.subheader("📄 LandXML (TIN -> pikkus/ristlõige/maht)")
+
+        landxml = st.file_uploader("Laadi üles LandXML (.xml)", type=["xml"], key="landxml_upload")
+
+        # advanced params (optional)
+        with st.expander("Arvutuse seaded (valikuline)"):
+            n_bins = st.slider("Lõigete arv", min_value=10, max_value=80, value=25, step=5)
+            top_pct = st.slider("Top percentile (maapinna eeldus)", min_value=80, max_value=99, value=95, step=1)
+
+        if landxml and st.button("Salvesta & arvuta", use_container_width=True):
             prefix = project_prefix(p["name"]) + "landxml/"
             key = upload_file(s3, prefix, landxml)
             xml_bytes = download_bytes(s3, key)
-            total_vol = parse_landxml_total_volume(xml_bytes)
-            set_project_landxml(p["id"], key, total_vol)
-            if total_vol is None:
-                st.warning("LandXML-ist ei leitud kindlat mahu väärtust. Fail salvestati, aga mahtu ei suutnud tuvastada.")
+
+            length_m, area_m2, vol_m3 = estimate_length_area_volume_from_tin(
+                xml_bytes,
+                n_bins=int(n_bins),
+                top_percentile=float(top_pct),
+            )
+
+            set_project_landxml(p["id"], key, vol_m3, length_m, area_m2)
+
+            if vol_m3 is None or area_m2 is None:
+                st.warning("TIN-ist ei suutnud kindlalt ristlõiget/mahtu hinnata. Fail salvestati. Võib olla vaja mudelit, kus on ka maapind/servad või eraldi existing/design pinnad.")
             else:
-                st.success(f"LandXML salvestatud. Leitud maht: {total_vol:.2f} m³")
+                st.success(f"Leitud: pikkus ~ {length_m:.2f} m, ristlõige ~ {area_m2:.2f} m², maht ~ {vol_m3:.1f} m³")
+
             st.rerun()
+
         st.markdown('</div>', unsafe_allow_html=True)
 
         # --- R2 files ---
