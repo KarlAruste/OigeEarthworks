@@ -126,7 +126,6 @@ def render_projects_view():
             set_project_landxml(p["id"], key, vol_m3, length_m, area_m2)
 
             if vol_m3 is None or area_m2 is None:
-    if length_m is not None:
         st.warning(
             f"TIN-ist ei suutnud kindlalt ristlõiget/mahtu hinnata. "
             f"Pikkus ~ {length_m:.1f} m. "
