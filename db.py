@@ -128,6 +128,18 @@ def list_projects():
             cur.execute(q)
             return [dict(r) for r in cur.fetchall()]
 
+def get_project(project_id: int):
+    q = """
+    SELECT id, name, start_date, end_date, status, planned_volume_m3, landxml_key
+    FROM projects
+    WHERE id=%s
+    """
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute(q, (project_id,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
 def set_project_landxml(project_id: int, landxml_key: str, planned_volume_m3):
     q = "UPDATE projects SET landxml_key=%s, planned_volume_m3=%s WHERE id=%s"
     with get_conn() as conn:
