@@ -138,14 +138,12 @@ def render_projects_view():
             "TIN-ist ei suutnud kindlalt ristlõiget/mahtu hinnata. "
             "Fail salvestati."
         )
-
- 
-            else:
-                st.success(
-                    f"Leitud: pikkus ~ {length_m:.2f} m, ristlõige ~ {area_m2:.2f} m², maht ~ {vol_m3:.1f} m³"
-                )
-
-            st.rerun()
+else:
+    st.success(
+        f"Leitud: pikkus ~ {length_m:.2f} m, "
+        f"ristlõige ~ {area_m2:.2f} m², "
+        f"maht ~ {vol_m3:.1f} m³"
+    )
 
         st.markdown("</div>", unsafe_allow_html=True)
 
