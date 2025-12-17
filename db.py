@@ -287,4 +287,60 @@ def set_task_status(task_id, new_status):
     with get_conn() as conn:
         with conn.cursor() as cur:
             if new_status == "done":
-                cur.execute("UPDATE tasks SE
+                cur.execute("UPDATE tasks SET status=%s, completed_at=NOW() WHERE id=%s", (new_status, task_id))
+            else:
+                cur.execute("UPDATE tasks SET status=%s WHERE id=%s", (new_status, task_id))
+        conn.commit()
+
+def bump_task_order(task_id: int, delta: int):
+    q = "UPDATE tasks SET sort_order = sort_order + %s WHERE id=%s"
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(q, (delta, task_id))
+        conn.commit()
+
+# ---------- Reports: daily profit series ----------
+def daily_profit_series(project_id):
+    q = """
+    WITH
+    costs AS (
+        SELECT work_date AS d, SUM(qty * ci.unit_price)::numeric(14,2) AS cost
+        FROM production_entries pe
+        JOIN cost_items ci ON ci.id = pe.cost_item_id
+        WHERE pe.project_id=%s
+        GROUP BY work_date
+    ),
+    rev AS (
+        SELECT rev_date AS d, SUM(amount)::numeric(14,2) AS revenue
+        FROM revenue_entries
+        WHERE project_id=%s
+        GROUP BY rev_date
+    ),
+    bounds AS (
+        SELECT
+          LEAST(
+            COALESCE((SELECT MIN(d) FROM costs), CURRENT_DATE),
+            COALESCE((SELECT MIN(d) FROM rev), CURRENT_DATE)
+          ) AS dmin,
+          GREATEST(
+            COALESCE((SELECT MAX(d) FROM costs), CURRENT_DATE),
+            COALESCE((SELECT MAX(d) FROM rev), CURRENT_DATE)
+          ) AS dmax
+    ),
+    days AS (
+        SELECT generate_series((SELECT dmin FROM bounds), (SELECT dmax FROM bounds), interval '1 day')::date AS d
+    )
+    SELECT
+      days.d AS date,
+      COALESCE(rev.revenue, 0)::numeric(14,2) AS revenue,
+      COALESCE(costs.cost, 0)::numeric(14,2) AS cost,
+      (COALESCE(rev.revenue, 0) - COALESCE(costs.cost, 0))::numeric(14,2) AS profit
+    FROM days
+    LEFT JOIN rev ON rev.d = days.d
+    LEFT JOIN costs ON costs.d = days.d
+    ORDER BY days.d;
+    """
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute(q, (project_id, project_id))
+            return [dict(r) for r in cur.fetchall()]
