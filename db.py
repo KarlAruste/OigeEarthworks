@@ -94,6 +94,9 @@ def init_db():
             cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS planned_volume_m3 NUMERIC(14,3)")
             cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS landxml_key TEXT")
             cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS sort_order INT NOT NULL DEFAULT 0")
+            cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS planned_length_m NUMERIC(14,3)")
+            cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS planned_area_m2 NUMERIC(14,3)")
+
 
             cur.execute("""
             CREATE TABLE IF NOT EXISTS weekly_plan (
@@ -119,7 +122,7 @@ def create_project(name: str, start_date=None, end_date=None):
 
 def list_projects():
     q = """
-    SELECT id, name, start_date, end_date, status, planned_volume_m3, landxml_key
+    SELECT id, name, start_date, end_date, status, planned_volume_m3, planned_length_m, planned_area_m2, landxml_key
     FROM projects
     ORDER BY name
     """
@@ -130,7 +133,7 @@ def list_projects():
 
 def get_project(project_id: int):
     q = """
-    SELECT id, name, start_date, end_date, status, planned_volume_m3, landxml_key
+    SELECT id, name, start_date, end_date, status, planned_volume_m3, planned_length_m, planned_area_m2, landxml_key
     FROM projects
     WHERE id=%s
     """
@@ -140,12 +143,20 @@ def get_project(project_id: int):
             row = cur.fetchone()
             return dict(row) if row else None
 
-def set_project_landxml(project_id: int, landxml_key: str, planned_volume_m3):
-    q = "UPDATE projects SET landxml_key=%s, planned_volume_m3=%s WHERE id=%s"
+def set_project_landxml(project_id: int, landxml_key: str, planned_volume_m3, planned_length_m, planned_area_m2):
+    q = """
+    UPDATE projects
+    SET landxml_key=%s,
+        planned_volume_m3=%s,
+        planned_length_m=%s,
+        planned_area_m2=%s
+    WHERE id=%s
+    """
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(q, (landxml_key, planned_volume_m3, project_id))
+            cur.execute(q, (landxml_key, planned_volume_m3, planned_length_m, planned_area_m2, project_id))
         conn.commit()
+
 
 # ---------- Cost items ----------
 def list_cost_items():
