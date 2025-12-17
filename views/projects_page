@@ -1,12 +1,15 @@
 import streamlit as st
 from datetime import date
-from db import list_projects, create_project
+from db import list_projects, create_project, set_project_landxml
 from r2 import get_s3, project_prefix, ensure_project_marker, list_files, upload_file, download_bytes, delete_key
+from landxml import parse_landxml_total_volume
 
 def render_projects_page():
     st.title("Projects")
+
     s3 = get_s3()
 
+    # Create project
     st.markdown('<div class="block">', unsafe_allow_html=True)
     st.subheader("➕ Loo projekt")
     c1, c2, c3 = st.columns([2,1,1])
@@ -32,13 +35,42 @@ def render_projects_page():
         st.info("Pole veel projekte.")
         return
 
-    proj_names = [p["name"] for p in projects]
-    selected_name = st.selectbox("Vali projekt", proj_names)
-    p = next(x for x in projects if x["name"] == selected_name)
-    prefix = project_prefix(selected_name)
+    # Select project by ID, show name (no IDs shown)
+    project_id = st.selectbox(
+        "Vali projekt",
+        options=[p["id"] for p in projects],
+        format_func=lambda pid: next(x["name"] for x in projects if x["id"] == pid),
+    )
+    p = next(x for x in projects if x["id"] == project_id)
+    prefix = project_prefix(p["name"])
 
-    st.caption(f"Projekt: **{p['name']}** • Tähtaeg: **{p.get('end_date')}**")
+    # Project header info
+    planned = p.get("planned_volume_m3")
+    planned_str = f"{float(planned):.2f} m³" if planned is not None else "—"
+    st.caption(f"Projekt: **{p['name']}** • Tähtaeg: **{p.get('end_date')}** • LandXML maht: **{planned_str}**")
 
+    # LandXML upload
+    st.markdown('<div class="block">', unsafe_allow_html=True)
+    st.subheader("📐 LandXML (planeeritud mahud)")
+    landxml = st.file_uploader("Laadi LandXML üles (projekti planeeritud mahud)", type=["xml"], accept_multiple_files=False)
+
+    if landxml is not None:
+        # store in R2
+        landxml_key = upload_file(s3, prefix, landxml, force_name="plan.landxml.xml")
+        xml_bytes = download_bytes(s3, landxml_key)
+        vol = parse_landxml_total_volume(xml_bytes)
+
+        if vol is None:
+            st.warning("LandXML-ist ei leidnud automaatselt mahu väärtust. (Järgmine samm: täpsem parser).")
+        else:
+            st.success(f"Leitud planeeritud maht: {vol:.2f} m³")
+
+        set_project_landxml(project_id, landxml_key, vol)
+        st.rerun()
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # Files
     st.markdown('<div class="block">', unsafe_allow_html=True)
     st.subheader("📤 Failid (Cloudflare R2)")
     uploads = st.file_uploader("Laadi üles failid", accept_multiple_files=True)
@@ -52,18 +84,3 @@ def render_projects_page():
     st.subheader("📄 Projekti failid")
     files = list_files(s3, prefix)
     if not files:
-        st.info("Selles projektis pole veel faile.")
-        return
-
-    for f in files:
-        a,b,c = st.columns([6,2,2])
-        with a:
-            st.write(f"📄 {f['name']}")
-            st.caption(f"{f['size']/1024:.1f} KB")
-        with b:
-            data = download_bytes(s3, f["key"])
-            st.download_button("⬇️ Laadi alla", data=data, file_name=f["name"], key=f"dl_{f['key']}", use_container_width=True)
-        with c:
-            if st.button("🗑️ Kustuta", key=f"del_{f['key']}", use_container_width=True):
-                delete_key(s3, f["key"])
-                st.rerun()
