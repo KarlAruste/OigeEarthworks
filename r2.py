@@ -47,9 +47,11 @@ def list_files(s3, prefix: str):
         files.append({"key": key, "name": key[len(prefix):], "size": it["Size"]})
     return sorted(files, key=lambda x: x["name"].lower())
 
-def upload_file(s3, prefix: str, file):
-    fname = safe_name(file.name)
+def upload_file(s3, prefix: str, file, force_name: str | None = None):
+    fname = safe_name(force_name or file.name)
     key = prefix + fname
+
+    # avoid overwrite
     base, dot, ext = fname.partition(".")
     ext = (dot + ext) if dot else ""
     i = 2
@@ -60,6 +62,7 @@ def upload_file(s3, prefix: str, file):
             i += 1
         except Exception:
             break
+
     s3.put_object(Bucket=BUCKET, Key=key, Body=file.getbuffer())
     return key
 
