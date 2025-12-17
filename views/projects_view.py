@@ -126,11 +126,19 @@ def render_projects_view():
             set_project_landxml(p["id"], key, vol_m3, length_m, area_m2)
 
             if vol_m3 is None or area_m2 is None:
-                if length_m is not None:
-        st.warning(f"TIN-ist ei suutnud kindlalt ristlõiget/mahtu hinnata. Pikkus ~ {length_m:.1f} m. "
-                   "See tähendab tavaliselt, et servad pole selles pinnas või TIN on ainult kraavi põhi.")
+    if length_m is not None:
+        st.warning(
+            f"TIN-ist ei suutnud kindlalt ristlõiget/mahtu hinnata. "
+            f"Pikkus ~ {length_m:.1f} m. "
+            "See tähendab tavaliselt, et servad pole selles pinnas "
+            "või TIN on ainult kraavi põhi."
+        )
     else:
-        st.warning("TIN-ist ei suutnud kindlalt ristlõiget/mahtu hinnata. Fail salvestati.")
+        st.warning(
+            "TIN-ist ei suutnud kindlalt ristlõiget/mahtu hinnata. "
+            "Fail salvestati."
+        )
+
  
             else:
                 st.success(
