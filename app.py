@@ -1,5 +1,6 @@
 import streamlit as st
 from db import init_db
+
 from views.projects_page import render_projects_page
 from views.workers_page import render_workers_page
 from views.tasks_page import render_tasks_page
@@ -25,7 +26,7 @@ h1,h2,h3 { color:#f9fafb; }
 </style>
 """, unsafe_allow_html=True)
 
-# Init DB tables
+# init DB tables (+ migrations)
 init_db()
 
 st.sidebar.markdown("## 🏗 Earthworks")
@@ -42,4 +43,3 @@ elif page == "🗓 Tasks":
     render_tasks_page()
 elif page == "📊 Reports":
     render_reports_page()
-
