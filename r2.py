@@ -50,6 +50,7 @@ def list_files(s3, prefix: str):
 def upload_file(s3, prefix: str, file):
     fname = safe_name(file.name)
     key = prefix + fname
+
     base, dot, ext = fname.partition(".")
     ext = (dot + ext) if dot else ""
     i = 2
@@ -61,10 +62,9 @@ def upload_file(s3, prefix: str, file):
         except Exception:
             break
 
-    # IMPORTANT: boto3 wants bytes/bytearray/file-like, not memoryview
+    # IMPORTANT: boto3 Body must be bytes/bytearray/file-like (not memoryview)
     s3.put_object(Bucket=BUCKET, Key=key, Body=file.getvalue())
     return key
-
 
 def download_bytes(s3, key: str) -> bytes:
     obj = s3.get_object(Bucket=BUCKET, Key=key)
