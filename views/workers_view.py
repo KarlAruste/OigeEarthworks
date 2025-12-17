@@ -2,7 +2,7 @@ import streamlit as st
 from datetime import date, timedelta
 from db import list_projects, add_worker, list_workers, add_assignment, list_assignments
 
-def render_workers_page():
+def render_workers_view():
     st.title("Workers & Assignments")
 
     projects = list_projects()
@@ -19,6 +19,7 @@ def render_workers_page():
         role = st.text_input("Roll", placeholder="nt Foreman / Worker")
     with c3:
         hourly = st.number_input("€/h", min_value=0.0, value=0.0, step=1.0)
+
     if st.button("Lisa töötaja", use_container_width=True):
         if not name.strip():
             st.warning("Sisesta nimi.")
@@ -34,14 +35,18 @@ def render_workers_page():
         return
 
     st.subheader("📅 Broneeri töötaja projektile (topeltbroneering keelatud)")
-    w_map = {f"{w['name']} (id={w['id']})": w["id"] for w in workers}
-    p_map = {f"{p['name']} (id={p['id']})": p["id"] for p in projects}
 
-    c1,c2 = st.columns([2,2])
-    with c1:
-        worker_label = st.selectbox("Töötaja", list(w_map.keys()))
-    with c2:
-        project_label = st.selectbox("Projekt", list(p_map.keys()))
+    worker_id = st.selectbox(
+        "Töötaja",
+        options=[w["id"] for w in workers],
+        format_func=lambda wid: next(x["name"] for x in workers if x["id"] == wid),
+    )
+
+    project_id = st.selectbox(
+        "Projekt",
+        options=[p["id"] for p in projects],
+        format_func=lambda pid: next(x["name"] for x in projects if x["id"] == pid),
+    )
 
     d1,d2 = st.columns([1,1])
     with d1:
@@ -50,9 +55,10 @@ def render_workers_page():
         end = st.date_input("Lõpp", value=date.today() + timedelta(days=6))
 
     note = st.text_input("Märkus (valikuline)")
+
     if st.button("Salvesta broneering", use_container_width=True):
         try:
-            add_assignment(w_map[worker_label], p_map[project_label], start, end, note)
+            add_assignment(worker_id, project_id, start, end, note)
             st.success("Broneering salvestatud.")
             st.rerun()
         except Exception as e:
