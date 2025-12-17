@@ -1,9 +1,19 @@
+# views/projects_view.py
 import streamlit as st
 from datetime import date
 
 from db import list_projects, create_project, get_project, set_project_landxml
-from r2 import get_s3, project_prefix, ensure_project_marker, list_files, upload_file, download_bytes, delete_key
+from r2 import (
+    get_s3,
+    project_prefix,
+    ensure_project_marker,
+    list_files,
+    upload_file,
+    download_bytes,
+    delete_key,
+)
 from landxml import estimate_length_area_volume_from_tin
+
 
 def render_projects_view():
     st.title("Projects")
@@ -17,7 +27,7 @@ def render_projects_view():
     # --- Create project ---
     st.markdown('<div class="block">', unsafe_allow_html=True)
     st.subheader("➕ Loo projekt")
-    c1, c2, c3 = st.columns([2,1,1])
+    c1, c2, c3 = st.columns([2, 1, 1])
     with c1:
         name = st.text_input("Projekti nimi", placeholder="nt Objekt_01")
     with c2:
@@ -33,7 +43,7 @@ def render_projects_view():
             ensure_project_marker(s3, project_prefix(name.strip()))
             st.success("Projekt loodud.")
             st.rerun()
-    st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
     # --- Project list ---
     st.subheader("📌 Minu projektid")
@@ -82,34 +92,47 @@ def render_projects_view():
         st.markdown('<div class="block">', unsafe_allow_html=True)
         st.subheader("📄 LandXML (TIN -> pikkus/ristlõige/maht)")
 
-        landxml = st.file_uploader("Laadi üles LandXML (.xml)", type=["xml"], key="landxml_upload")
+        landxml = st.file_uploader(
+            "Laadi üles LandXML (.xml)",
+            type=["xml"],
+            key="landxml_upload",
+            help="Lae üles kraavi TIN LandXML. Rakendus proovib leida servad ja arvutada ristlõike."
+        )
 
-        # advanced params (optional)
         with st.expander("Arvutuse seaded (valikuline)"):
-            n_bins = st.slider("Lõigete arv", min_value=10, max_value=80, value=25, step=5)
-            top_pct = st.slider("Top percentile (maapinna eeldus)", min_value=80, max_value=99, value=95, step=1)
+            n_bins = st.slider("Lõigete arv", min_value=10, max_value=120, value=30, step=5)
+            edge_tail = st.slider("Serva tail %", min_value=5, max_value=25, value=10, step=1)
+            slice_ratio = st.slider("Slice paksus (ratio %)", min_value=1, max_value=10, value=3, step=1) / 100.0
 
         if landxml and st.button("Salvesta & arvuta", use_container_width=True):
             prefix = project_prefix(p["name"]) + "landxml/"
             key = upload_file(s3, prefix, landxml)
+
             xml_bytes = download_bytes(s3, key)
 
             length_m, area_m2, vol_m3 = estimate_length_area_volume_from_tin(
                 xml_bytes,
                 n_bins=int(n_bins),
-                top_percentile=float(top_pct),
+                slice_thickness_ratio=float(slice_ratio),
+                edge_tail_pct=float(edge_tail),
             )
 
             set_project_landxml(p["id"], key, vol_m3, length_m, area_m2)
 
             if vol_m3 is None or area_m2 is None:
-                st.warning("TIN-ist ei suutnud kindlalt ristlõiget/mahtu hinnata. Fail salvestati. Võib olla vaja mudelit, kus on ka maapind/servad või eraldi existing/design pinnad.")
+                st.warning(
+                    "TIN-ist ei suutnud kindlalt ristlõiget/mahtu hinnata. Fail salvestati. "
+                    "Proovi suurendada 'Slice paksus' või muuta 'Serva tail %'. "
+                    "Kui servad on eraldi pinnas, on vaja teist LandXML-i."
+                )
             else:
-                st.success(f"Leitud: pikkus ~ {length_m:.2f} m, ristlõige ~ {area_m2:.2f} m², maht ~ {vol_m3:.1f} m³")
+                st.success(
+                    f"Leitud: pikkus ~ {length_m:.2f} m, ristlõige ~ {area_m2:.2f} m², maht ~ {vol_m3:.1f} m³"
+                )
 
             st.rerun()
 
-        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
         # --- R2 files ---
         st.markdown('<div class="block">', unsafe_allow_html=True)
@@ -121,8 +144,9 @@ def render_projects_view():
                 upload_file(s3, prefix, up)
             st.success(f"Üles laaditud {len(uploads)} faili.")
             st.rerun()
-        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
+        # --- File list ---
         st.subheader("📄 Projekti failid")
         prefix = project_prefix(p["name"])
         files = list_files(s3, prefix)
@@ -131,13 +155,19 @@ def render_projects_view():
             return
 
         for f in files:
-            a,b,c = st.columns([6,2,2])
+            a, b, c = st.columns([6, 2, 2])
             with a:
                 st.write(f"📄 {f['name']}")
-                st.caption(f"{f['size']/1024:.1f} KB")
+                st.caption(f"{f['size'] / 1024:.1f} KB")
             with b:
                 data = download_bytes(s3, f["key"])
-                st.download_button("⬇️ Laadi alla", data=data, file_name=f["name"], key=f"dl_{f['key']}", use_container_width=True)
+                st.download_button(
+                    "⬇️ Laadi alla",
+                    data=data,
+                    file_name=f["name"],
+                    key=f"dl_{f['key']}",
+                    use_container_width=True,
+                )
             with c:
                 if st.button("🗑️ Kustuta", key=f"del_{f['key']}", use_container_width=True):
                     delete_key(s3, f["key"])
