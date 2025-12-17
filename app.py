@@ -1,10 +1,10 @@
 import streamlit as st
 from db import init_db
 
-from views.projects_page import render_projects_page
-from views.workers_page import render_workers_page
-from views.tasks_page import render_tasks_page
-from views.reports_page import render_reports_page
+from views.projects_view import render_projects_view
+from views.workers_view import render_workers_view
+from views.tasks_view import render_tasks_view
+from views.reports_view import render_reports_view
 
 st.set_page_config(page_title="Earthworks App", layout="wide")
 
@@ -36,10 +36,10 @@ st.sidebar.divider()
 page = st.sidebar.radio("", ["📁 Projects", "👷 Workers", "🗓 Tasks", "📊 Reports"])
 
 if page == "📁 Projects":
-    render_projects_page()
+    render_projects_view()
 elif page == "👷 Workers":
-    render_workers_page()
+    render_workers_view()()
 elif page == "🗓 Tasks":
-    render_tasks_page()
+    render_tasks_view()
 elif page == "📊 Reports":
-    render_reports_page()
+    render_reports_view()
