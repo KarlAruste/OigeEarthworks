@@ -2,8 +2,7 @@ import os
 from contextlib import contextmanager
 import psycopg
 
-from db import init_db
-init_db()
+
 
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
