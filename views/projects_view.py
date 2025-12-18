@@ -125,7 +125,8 @@ def render_projects_view():
 
             set_project_landxml(p["id"], key, vol_m3, length_m, area_m2)
 
-            if vol_m3 is None or area_m2 is None:
+            # --- tulemuse teated ---
+if vol_m3 is None or area_m2 is None:
     if length_m is not None:
         st.warning(
             f"TIN-ist ei suutnud kindlalt ristlõiget/mahtu hinnata. "
@@ -143,7 +144,8 @@ else:
         f"Leitud: pikkus ~ {length_m:.2f} m, "
         f"ristlõige ~ {area_m2:.2f} m², "
         f"maht ~ {vol_m3:.1f} m³"
-    ))
+    )
+
 
         st.markdown("</div>", unsafe_allow_html=True)
 
