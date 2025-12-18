@@ -79,6 +79,42 @@ def init_db():
         );
         """)
 
+        # ---- cost items ----
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS cost_items (
+            id SERIAL PRIMARY KEY,
+            name TEXT UNIQUE NOT NULL,
+            unit TEXT NOT NULL,
+            unit_price DOUBLE PRECISION NOT NULL DEFAULT 0,
+            created_at TIMESTAMPTZ DEFAULT now()
+        );
+        """)
+
+        # ---- production (costs by work done) ----
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS production (
+            id SERIAL PRIMARY KEY,
+            project_id INT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            cost_item_id INT NOT NULL REFERENCES cost_items(id) ON DELETE RESTRICT,
+            qty DOUBLE PRECISION NOT NULL DEFAULT 0,
+            work_date DATE NOT NULL,
+            note TEXT NULL,
+            created_at TIMESTAMPTZ DEFAULT now()
+        );
+        """)
+
+        # ---- revenue ----
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS revenue (
+            id SERIAL PRIMARY KEY,
+            project_id INT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            amount DOUBLE PRECISION NOT NULL DEFAULT 0,
+            rev_date DATE NOT NULL,
+            note TEXT NULL,
+            created_at TIMESTAMPTZ DEFAULT now()
+        );
+        """)
+
         conn.commit()
 
 
@@ -263,9 +299,7 @@ def set_task_deps(task_id: int, dep_ids: list[int]):
     task_id = int(task_id)
 
     with get_conn() as conn:
-        # wipe old deps
         conn.execute("DELETE FROM task_deps WHERE task_id=%s", (task_id,))
-        # insert new deps
         for d in dep_ids:
             if d == task_id:
                 continue
@@ -285,10 +319,8 @@ def _deps_done(task_id: int) -> bool:
             WHERE d.task_id=%s
         """, (int(task_id),)).fetchall()
 
-    # if no deps -> ok
     if not rows:
         return True
-    # all must be done
     return all((r[0] == "done") for r in rows)
 
 
@@ -297,7 +329,6 @@ def set_task_status(task_id: int, status: str):
     if status not in ("todo", "in_progress", "done"):
         raise ValueError("Invalid status.")
 
-    # block if deps not done
     if status in ("in_progress", "done") and not _deps_done(task_id):
         raise ValueError("Ei saa alustada/lõpetada — eeldustööd on tegemata (peavad olema DONE).")
 
@@ -317,7 +348,6 @@ def list_tasks(project_id: int):
             ORDER BY created_at ASC, id ASC
         """, (project_id,)).fetchall()
 
-        # deps per task
         deps = conn.execute("""
             SELECT task_id, depends_on_task_id
             FROM task_deps
@@ -328,7 +358,6 @@ def list_tasks(project_id: int):
         for t_id, dep_id in deps:
             deps_map.setdefault(t_id, []).append(dep_id)
 
-        # status for dep tasks (for blocked check)
         status_map = {}
         if tasks:
             ids = tuple([t[0] for t in tasks])
@@ -355,3 +384,93 @@ def list_tasks(project_id: int):
             "blocked": blocked,
         })
     return out
+
+
+# =========================
+# Reports / Cost & Revenue
+# =========================
+def list_cost_items():
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT id, name, unit, unit_price
+            FROM cost_items
+            ORDER BY name ASC
+        """).fetchall()
+    return [{"id": r[0], "name": r[1], "unit": r[2], "unit_price": r[3]} for r in rows]
+
+
+def add_cost_item(name: str, unit: str, unit_price: float):
+    name = (name or "").strip()
+    unit = (unit or "").strip()
+    unit_price = float(unit_price or 0.0)
+    if not name or not unit:
+        raise ValueError("Täida nimetus ja ühik.")
+
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT INTO cost_items (name, unit, unit_price)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (name) DO UPDATE
+            SET unit=EXCLUDED.unit,
+                unit_price=EXCLUDED.unit_price
+        """, (name, unit, unit_price))
+        conn.commit()
+
+
+def add_production(project_id: int, cost_item_id: int, qty: float, work_date, note: str | None = None):
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT INTO production (project_id, cost_item_id, qty, work_date, note)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (int(project_id), int(cost_item_id), float(qty or 0.0), work_date, note))
+        conn.commit()
+
+
+def add_revenue(project_id: int, amount: float, rev_date, note: str | None = None):
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT INTO revenue (project_id, amount, rev_date, note)
+            VALUES (%s, %s, %s, %s)
+        """, (int(project_id), float(amount or 0.0), rev_date, note))
+        conn.commit()
+
+
+def daily_profit_series(project_id: int):
+    project_id = int(project_id)
+
+    with get_conn() as conn:
+        rows = conn.execute("""
+            WITH d AS (
+                SELECT work_date::date AS dt
+                FROM production
+                WHERE project_id=%s
+                UNION
+                SELECT rev_date::date AS dt
+                FROM revenue
+                WHERE project_id=%s
+            ),
+            rev AS (
+                SELECT rev_date::date AS dt, SUM(amount) AS revenue
+                FROM revenue
+                WHERE project_id=%s
+                GROUP BY rev_date::date
+            ),
+            cost AS (
+                SELECT p.work_date::date AS dt, SUM(p.qty * ci.unit_price) AS cost
+                FROM production p
+                JOIN cost_items ci ON ci.id = p.cost_item_id
+                WHERE p.project_id=%s
+                GROUP BY p.work_date::date
+            )
+            SELECT
+                d.dt AS date,
+                COALESCE(rev.revenue, 0) AS revenue,
+                COALESCE(cost.cost, 0) AS cost,
+                COALESCE(rev.revenue, 0) - COALESCE(cost.cost, 0) AS profit
+            FROM d
+            LEFT JOIN rev ON rev.dt = d.dt
+            LEFT JOIN cost ON cost.dt = d.dt
+            ORDER BY d.dt ASC
+        """, (project_id, project_id, project_id, project_id)).fetchall()
+
+    return [{"date": r[0], "revenue": float(r[1]), "cost": float(r[2]), "profit": float(r[3])} for r in rows]
