@@ -190,7 +190,7 @@ st.markdown("</div>", unsafe_allow_html=True)
 
 
         # ---------------- R2 file upload ----------------
-        st.markdown('<div class="block">', unsafe_allow_html=True)
+st.markdown('<div class="block">', unsafe_allow_html=True)
         st.subheader("📤 Failid (Cloudflare R2)")
 
         uploads = st.file_uploader("Laadi üles failid", accept_multiple_files=True, key="proj_files")
