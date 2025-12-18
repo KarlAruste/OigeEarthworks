@@ -2,6 +2,10 @@ import os
 from contextlib import contextmanager
 import psycopg
 
+from db import init_db
+init_db()
+
+
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
 
@@ -32,15 +36,40 @@ def init_db():
         conn.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS top_width_m DOUBLE PRECISION;")
 
         # ---- workers ----
+        # Create table if it does not exist
         conn.execute("""
         CREATE TABLE IF NOT EXISTS workers (
             id SERIAL PRIMARY KEY,
             name TEXT UNIQUE NOT NULL,
             role TEXT NULL,
-            hourly_rate DOUBLE PRECISION NOT NULL DEFAULT 0,
             active BOOLEAN NOT NULL DEFAULT TRUE,
             created_at TIMESTAMPTZ DEFAULT now()
         );
+        """)
+
+        # ✅ MIGRATIONS for existing DBs (Render / production)
+        # Ensure required columns exist even if table was created earlier
+        conn.execute("ALTER TABLE workers ADD COLUMN IF NOT EXISTS role TEXT;")
+        conn.execute("ALTER TABLE workers ADD COLUMN IF NOT EXISTS hourly_rate DOUBLE PRECISION NOT NULL DEFAULT 0;")
+        conn.execute("ALTER TABLE workers ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE;")
+        conn.execute("ALTER TABLE workers ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();")
+
+        # Optional: if you previously used another column name (hourly), copy it over once.
+        # Safe: does nothing if hourly column doesn't exist.
+        conn.execute("""
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name='workers' AND column_name='hourly'
+            ) AND NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name='workers' AND column_name='hourly_rate'
+            ) THEN
+                ALTER TABLE workers ADD COLUMN hourly_rate DOUBLE PRECISION NOT NULL DEFAULT 0;
+                EXECUTE 'UPDATE workers SET hourly_rate = COALESCE(hourly, 0)';
+            END IF;
+        END $$;
         """)
 
         # ---- worker assignments ----
