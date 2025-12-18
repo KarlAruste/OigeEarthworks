@@ -1,11 +1,21 @@
 # views/projects_view.py
 import streamlit as st
 from datetime import date
+import numpy as np
 
-import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+from streamlit_plotly_events import plotly_events
+
 from landxml import estimate_length_area_volume_from_tin, landxml_debug_views
 
-from db import list_projects, create_project, get_project, set_project_landxml
+from db import (
+    list_projects,
+    create_project,
+    get_project,
+    set_project_landxml,
+    set_project_length,  # kui sul pole seda veel, anna märku
+)
+
 from r2 import (
     get_s3,
     project_prefix,
@@ -17,6 +27,17 @@ from r2 import (
 )
 
 
+def _polyline_length_m(points):
+    if len(points) < 2:
+        return 0.0
+    total = 0.0
+    for i in range(1, len(points)):
+        dx = points[i]["x"] - points[i - 1]["x"]
+        dy = points[i]["y"] - points[i - 1]["y"]
+        total += float((dx * dx + dy * dy) ** 0.5)
+    return float(total)
+
+
 def render_projects_view():
     st.title("Projects")
 
@@ -25,6 +46,9 @@ def render_projects_view():
 
     if "project_id" not in st.session_state:
         st.session_state["project_id"] = None
+
+    if "picked_points" not in st.session_state:
+        st.session_state["picked_points"] = []
 
     # ---------------- Create project ----------------
     st.markdown('<div class="block">', unsafe_allow_html=True)
@@ -62,6 +86,7 @@ def render_projects_view():
         for proj in projects:
             if st.button(proj["name"], use_container_width=True, key=f"projbtn_{proj['id']}"):
                 st.session_state["project_id"] = proj["id"]
+                st.session_state["picked_points"] = []  # reset polyline when switching projects
                 st.rerun()
 
     with right:
@@ -87,9 +112,13 @@ def render_projects_view():
             st.write(f"**Pikkus:** {float(length):.2f} m")
         if area is not None:
             st.write(f"**Keskmine ristlõige:** {float(area):.2f} m²")
-        if vol is not None:
+
+        # kui tahad, näita maht arvutatult pikkus*ristlõige
+        if length is not None and area is not None:
+            st.write(f"**Planeeritud maht (arvutatud):** {float(length) * float(area):.1f} m³")
+        elif vol is not None:
             st.write(f"**Planeeritud maht:** {float(vol):.1f} m³")
-        if vol is None:
+        else:
             st.info("Planeeritud maht puudub. Laadi LandXML üles.")
 
         # ---------------- LandXML upload ----------------
@@ -121,7 +150,6 @@ def render_projects_view():
 
             set_project_landxml(p["id"], key, vol_m3, length_m, area_m2)
 
-            # --- tulemuse teated ---
             if vol_m3 is None or area_m2 is None:
                 if length_m is not None:
                     st.warning(
@@ -131,10 +159,7 @@ def render_projects_view():
                         "või TIN on ainult kraavi põhi."
                     )
                 else:
-                    st.warning(
-                        "TIN-ist ei suutnud kindlalt ristlõiget/mahtu hinnata. "
-                        "Fail salvestati."
-                    )
+                    st.warning("TIN-ist ei suutnud kindlalt ristlõiget/mahtu hinnata. Fail salvestati.")
             else:
                 st.success(
                     f"Leitud: pikkus ~ {length_m:.2f} m, "
@@ -142,51 +167,109 @@ def render_projects_view():
                     f"maht ~ {vol_m3:.1f} m³"
                 )
 
+            st.session_state["picked_points"] = []  # reset after new landxml
             st.rerun()
 
         st.markdown("</div>", unsafe_allow_html=True)
 
-        # ---------------- Visualiseerimine ----------------
+        # ---------------- 2D + polyline snap ----------------
         st.markdown('<div class="block">', unsafe_allow_html=True)
-        st.subheader("👁 2D vaade (TIN + pikkus) ja ristlõiked")
+        st.subheader("👁 2D (zoom) + vali pikkus (polyline, snap TIN punktidele)")
 
         if p.get("landxml_key"):
-            if st.button("Näita 2D pilti", use_container_width=True):
-                xml_bytes = download_bytes(s3, p["landxml_key"])
+            xml_bytes = download_bytes(s3, p["landxml_key"])
+            dbg = landxml_debug_views(xml_bytes, sample_slices=3)
 
-                dbg = landxml_debug_views(xml_bytes, sample_slices=3)
-                if not dbg:
-                    st.warning("Ei suutnud LandXML-ist pilti teha.")
-                else:
-                    XY = dbg["pts_xy"]
-                    axis_dir = dbg["axis_dir"]
-                    length_m = dbg["length_m"]
+            if not dbg:
+                st.warning("Ei suutnud LandXML-ist 2D vaadet teha.")
+            else:
+                XY = dbg["pts_xy"]  # eeldus: X=Easting, Y=Northing
+                length_auto = dbg["length_m"]
 
-                    # --- 2D map view ---
-                    fig = plt.figure()
-                    plt.scatter(XY[:, 0], XY[:, 1], s=1)
-                    plt.title(f"TIN punktid + põhitelg (pikkus ≈ {length_m:.2f} m)")
+                st.caption("Kliki punktid mööda kraavi. Iga klõps snäpib lähimale TIN punktile. Zoom: hiire rull, Pan: lohista.")
 
-                    cx, cy = XY.mean(axis=0)
-                    dx, dy = axis_dir[0], axis_dir[1]
-                    scale = max(
-                        XY[:, 0].max() - XY[:, 0].min(),
-                        XY[:, 1].max() - XY[:, 1].min()
-                    ) * 0.6
-                    x1, y1 = cx - dx * scale, cy - dy * scale
-                    x2, y2 = cx + dx * scale, cy + dy * scale
-                    plt.plot([x1, x2], [y1, y2], linewidth=2)
-                    plt.axis("equal")
+                fig = go.Figure()
+                fig.add_trace(go.Scattergl(
+                    x=XY[:, 0],
+                    y=XY[:, 1],
+                    mode="markers",
+                    marker=dict(size=3),
+                    name="TIN"
+                ))
 
-                    st.pyplot(fig, clear_figure=True)
+                # show chosen polyline
+                if st.session_state["picked_points"]:
+                    xs = [pt["x"] for pt in st.session_state["picked_points"]]
+                    ys = [pt["y"] for pt in st.session_state["picked_points"]]
+                    fig.add_trace(go.Scatter(
+                        x=xs,
+                        y=ys,
+                        mode="lines+markers",
+                        marker=dict(size=8),
+                        name="Valitud polyline"
+                    ))
 
-                    # --- cross-sections ---
-                    for i, sec in enumerate(dbg["samples"], start=1):
-                        fig2 = plt.figure()
-                        plt.plot(sec["t"], sec["z"], linewidth=2)
-                        plt.plot(sec["t"], sec["top"], linewidth=2)
-                        plt.title(f"Ristlõige {i} (pindala ≈ {sec['area']:.2f} m²)")
-                        st.pyplot(fig2, clear_figure=True)
+                fig.update_layout(
+                    height=520,
+                    margin=dict(l=10, r=10, t=40, b=10),
+                    title=f"TIN (auto pikkus ≈ {length_auto:.2f} m)",
+                    xaxis_title="Easting (m)",
+                    yaxis_title="Northing (m)",
+                )
+                fig.update_yaxes(scaleanchor="x", scaleratio=1)
+                fig.update_layout(dragmode="pan")
+
+                clicked = plotly_events(
+                    fig,
+                    click_event=True,
+                    select_event=False,
+                    hover_event=False,
+                    override_height=520,
+                    key="tin_poly_pick"
+                )
+
+                c1, c2, c3 = st.columns([1, 1, 2])
+                with c1:
+                    if st.button("🧹 Tühjenda valik", use_container_width=True):
+                        st.session_state["picked_points"] = []
+                        st.rerun()
+                with c2:
+                    if st.button("↩️ Undo viimane", use_container_width=True):
+                        if st.session_state["picked_points"]:
+                            st.session_state["picked_points"].pop()
+                            st.rerun()
+
+                # ADD clicked point with SNAP to nearest TIN point (A)
+                if clicked:
+                    pt = clicked[0]
+                    cx, cy = float(pt["x"]), float(pt["y"])
+
+                    dx = XY[:, 0] - cx
+                    dy = XY[:, 1] - cy
+                    idx = int(np.argmin(dx * dx + dy * dy))
+                    sx = float(XY[idx, 0])
+                    sy = float(XY[idx, 1])
+
+                    # avoid duplicates if clicking same spot
+                    if not st.session_state["picked_points"] or (
+                        abs(st.session_state["picked_points"][-1]["x"] - sx) > 0.001 or
+                        abs(st.session_state["picked_points"][-1]["y"] - sy) > 0.001
+                    ):
+                        st.session_state["picked_points"].append({"x": sx, "y": sy})
+
+                    st.rerun()
+
+                chosen_len = _polyline_length_m(st.session_state["picked_points"])
+                st.write(f"**Valitud pikkus:** {chosen_len:.2f} m (punktid: {len(st.session_state['picked_points'])})")
+
+                if st.button("💾 Salvesta valitud pikkus projekti", use_container_width=True):
+                    if chosen_len < 1.0:
+                        st.warning("Vali vähemalt 2 punkti, et pikkus tekiks.")
+                    else:
+                        set_project_length(p["id"], chosen_len)
+                        st.success("Pikkus salvestatud (planned_length_m).")
+                        st.rerun()
+
         else:
             st.info("Laadi LandXML üles ja vajuta 'Salvesta & arvuta', et tekiks landxml_key.")
 
