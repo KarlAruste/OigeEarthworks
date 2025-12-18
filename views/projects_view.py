@@ -143,6 +143,51 @@ def render_projects_view():
             st.rerun()
 
         st.markdown("</div>", unsafe_allow_html=True)
+        
+        # ---------------- Visualiseerimine ----------------
+st.markdown('<div class="block">', unsafe_allow_html=True)
+st.subheader("👁 2D vaade (TIN + pikkus) ja ristlõiked")
+
+if p.get("landxml_key"):
+    if st.button("Näita 2D pilti", use_container_width=True):
+        xml_bytes = download_bytes(s3, p["landxml_key"])
+
+        dbg = landxml_debug_views(xml_bytes, sample_slices=3)
+        if not dbg:
+            st.warning("Ei suutnud LandXML-ist pilti teha.")
+        else:
+            XY = dbg["pts_xy"]
+            axis_dir = dbg["axis_dir"]
+            length_m = dbg["length_m"]
+
+            # --- 2D map view (punktid + põhitelg) ---
+            fig = plt.figure()
+            plt.scatter(XY[:, 0], XY[:, 1], s=1)
+            plt.title(f"TIN punktid + põhitelg (pikkus ≈ {length_m:.2f} m)")
+
+            cx, cy = XY.mean(axis=0)
+            dx, dy = axis_dir[0], axis_dir[1]
+            scale = max(XY[:,0].max()-XY[:,0].min(), XY[:,1].max()-XY[:,1].min()) * 0.6
+            x1, y1 = cx - dx*scale, cy - dy*scale
+            x2, y2 = cx + dx*scale, cy + dy*scale
+            plt.plot([x1, x2], [y1, y2], linewidth=2)
+            plt.axis("equal")
+
+            st.pyplot(fig, clear_figure=True)
+
+            # --- 3 ristlõiget ---
+            for i, s in enumerate(dbg["samples"], start=1):
+                fig2 = plt.figure()
+                plt.plot(s["t"], s["z"], linewidth=2)
+                plt.plot(s["t"], s["top"], linewidth=2)
+                plt.title(f"Ristlõige {i} (pindala ≈ {s['area']:.2f} m²)")
+                st.pyplot(fig2, clear_figure=True)
+
+else:
+    st.info("Laadi LandXML üles ja vajuta 'Salvesta & arvuta', et tekiks landxml_key.")
+
+st.markdown("</div>", unsafe_allow_html=True)
+
 
         # ---------------- R2 file upload ----------------
         st.markdown('<div class="block">', unsafe_allow_html=True)
