@@ -24,9 +24,10 @@ def render_projects_view():
     if "project_id" not in st.session_state:
         st.session_state["project_id"] = None
 
-    # --- Create project ---
+    # ---------------- Create project ----------------
     st.markdown('<div class="block">', unsafe_allow_html=True)
     st.subheader("➕ Loo projekt")
+
     c1, c2, c3 = st.columns([2, 1, 1])
     with c1:
         name = st.text_input("Projekti nimi", placeholder="nt Objekt_01")
@@ -43,9 +44,10 @@ def render_projects_view():
             ensure_project_marker(s3, project_prefix(name.strip()))
             st.success("Projekt loodud.")
             st.rerun()
+
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # --- Project list ---
+    # ---------------- Project list ----------------
     st.subheader("📌 Minu projektid")
     if not projects:
         st.info("Pole veel projekte.")
@@ -55,17 +57,18 @@ def render_projects_view():
 
     with left:
         st.caption("Vali projekt:")
-        for p in projects:
-            if st.button(p["name"], use_container_width=True, key=f"projbtn_{p['id']}"):
-                st.session_state["project_id"] = p["id"]
+        for proj in projects:
+            if st.button(proj["name"], use_container_width=True, key=f"projbtn_{proj['id']}"):
+                st.session_state["project_id"] = proj["id"]
                 st.rerun()
 
     with right:
-        if not st.session_state["project_id"]:
+        pid = st.session_state.get("project_id")
+        if not pid:
             st.info("Vali vasakult projekt.")
             return
 
-        p = get_project(st.session_state["project_id"])
+        p = get_project(pid)
         if not p:
             st.session_state["project_id"] = None
             st.rerun()
@@ -84,74 +87,67 @@ def render_projects_view():
             st.write(f"**Keskmine ristlõige:** {float(area):.2f} m²")
         if vol is not None:
             st.write(f"**Planeeritud maht:** {float(vol):.1f} m³")
-
         if vol is None:
             st.info("Planeeritud maht puudub. Laadi LandXML üles.")
 
-        # --- LandXML upload ---
+        # ---------------- LandXML upload ----------------
         st.markdown('<div class="block">', unsafe_allow_html=True)
         st.subheader("📄 LandXML (TIN -> pikkus/ristlõige/maht)")
 
-        landxml = st.file_uploader(
-            "Laadi üles LandXML (.xml)",
-            type=["xml"],
-            key="landxml_upload",
-            help="Lae üles kraavi TIN LandXML. Rakendus proovib leida servad ja arvutada ristlõike."
-        )
+        landxml = st.file_uploader("Laadi üles LandXML (.xml)", type=["xml"], key="landxml_upload")
 
         with st.expander("Arvutuse seaded (valikuline)"):
-            n_bins = st.slider("Lõigete arv", min_value=10, max_value=120, value=30, step=5)
+            n_bins = st.slider("Lõigete arv", min_value=10, max_value=120, value=40, step=5)
             edge_tail = st.slider("Serva tail %", min_value=5, max_value=25, value=10, step=1)
-            slice_ratio = st.slider("Slice paksus (ratio %)", min_value=1, max_value=10, value=3, step=1) / 100.0
+            slice_ratio = st.slider("Slice paksus (ratio %)", min_value=1, max_value=10, value=4, step=1) / 100.0
             edge_z_pct = st.slider("Serva Z percentiil (kõrgus)", 90, 99, 97, 1)
             fallback_top = st.slider("Fallback top %", 85, 99, 95, 1)
 
         if landxml and st.button("Salvesta & arvuta", use_container_width=True):
             prefix = project_prefix(p["name"]) + "landxml/"
             key = upload_file(s3, prefix, landxml)
-
             xml_bytes = download_bytes(s3, key)
 
             length_m, area_m2, vol_m3 = estimate_length_area_volume_from_tin(
-            xml_bytes,
-            n_bins=int(n_bins),
-            slice_thickness_ratio=float(slice_ratio),
-            edge_tail_pct=float(edge_tail),
-            edge_z_pct=float(edge_z_pct),
-            top_percentile_fallback=float(fallback_top),
-         )
-
-
+                xml_bytes,
+                n_bins=int(n_bins),
+                slice_thickness_ratio=float(slice_ratio),
+                edge_tail_pct=float(edge_tail),
+                edge_z_pct=float(edge_z_pct),
+                top_percentile_fallback=float(fallback_top),
+            )
 
             set_project_landxml(p["id"], key, vol_m3, length_m, area_m2)
 
             # --- tulemuse teated ---
-if vol_m3 is None or area_m2 is None:
-    if length_m is not None:
-        st.warning(
-            f"TIN-ist ei suutnud kindlalt ristlõiget/mahtu hinnata. "
-            f"Pikkus ~ {length_m:.1f} m. "
-            "See tähendab tavaliselt, et servad pole selles pinnas "
-            "või TIN on ainult kraavi põhi."
-        )
-    else:
-        st.warning(
-            "TIN-ist ei suutnud kindlalt ristlõiget/mahtu hinnata. "
-            "Fail salvestati."
-        )
-else:
-    st.success(
-        f"Leitud: pikkus ~ {length_m:.2f} m, "
-        f"ristlõige ~ {area_m2:.2f} m², "
-        f"maht ~ {vol_m3:.1f} m³"
-    )
+            if vol_m3 is None or area_m2 is None:
+                if length_m is not None:
+                    st.warning(
+                        f"TIN-ist ei suutnud kindlalt ristlõiget/mahtu hinnata. "
+                        f"Pikkus ~ {length_m:.1f} m. "
+                        "See tähendab tavaliselt, et servad pole selles pinnas "
+                        "või TIN on ainult kraavi põhi."
+                    )
+                else:
+                    st.warning(
+                        "TIN-ist ei suutnud kindlalt ristlõiget/mahtu hinnata. "
+                        "Fail salvestati."
+                    )
+            else:
+                st.success(
+                    f"Leitud: pikkus ~ {length_m:.2f} m, "
+                    f"ristlõige ~ {area_m2:.2f} m², "
+                    f"maht ~ {vol_m3:.1f} m³"
+                )
 
+            st.rerun()
 
         st.markdown("</div>", unsafe_allow_html=True)
 
-        # --- R2 files ---
+        # ---------------- R2 file upload ----------------
         st.markdown('<div class="block">', unsafe_allow_html=True)
         st.subheader("📤 Failid (Cloudflare R2)")
+
         uploads = st.file_uploader("Laadi üles failid", accept_multiple_files=True, key="proj_files")
         if uploads:
             prefix = project_prefix(p["name"])
@@ -159,12 +155,14 @@ else:
                 upload_file(s3, prefix, up)
             st.success(f"Üles laaditud {len(uploads)} faili.")
             st.rerun()
+
         st.markdown("</div>", unsafe_allow_html=True)
 
-        # --- File list ---
+        # ---------------- File list ----------------
         st.subheader("📄 Projekti failid")
         prefix = project_prefix(p["name"])
         files = list_files(s3, prefix)
+
         if not files:
             st.info("Selles projektis pole veel faile.")
             return
