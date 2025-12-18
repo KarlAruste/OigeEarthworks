@@ -1,3 +1,4 @@
+# views/projects_view.py
 import streamlit as st
 from datetime import date
 
@@ -11,7 +12,8 @@ from r2 import (
     list_files,
     delete_key,
 )
-from landxml import estimate_top_width_from_tin
+
+from landxml import compute_cross_sections_every_5m
 
 
 def _area_trapezoid(depth: float, b: float, n: float) -> float:
@@ -80,38 +82,63 @@ def render_projects_view():
         st.subheader(p["name"])
         st.caption(f"Tähtaeg: {p.get('end_date')}")
 
-        # ---------------- LandXML upload (TOP WIDTH only) ----------------
+        # ---------------- LandXML upload (TOP WIDTH from cross-sections) ----------------
         st.markdown('<div class="block">', unsafe_allow_html=True)
         st.subheader("📄 LandXML → pealmine laius (EG–EG)")
 
         landxml = st.file_uploader("Laadi üles LandXML (.xml)", type=["xml"], key="landxml_upload")
 
-        with st.expander("Laiuse lugemise seaded (valikuline)"):
-            n_bins = st.slider("Slice arv", min_value=10, max_value=120, value=40, step=5)
-            edge_tail = st.slider("Serva tail %", min_value=5, max_value=25, value=10, step=1)
-            slice_ratio = st.slider("Slice paksus %", min_value=1, max_value=10, value=4, step=1) / 100.0
+        with st.expander("Ristlõike seaded (valikuline)"):
+            step_m = st.number_input("Samm (m) – iga X meetri tagant ristlõige", min_value=1.0, value=5.0, step=1.0)
+            slice_thickness_m = st.number_input("Slice paksus (m)", min_value=0.2, value=1.0, step=0.1)
+
+            cA, cB, cC, cD = st.columns(4)
+            with cA:
+                edge_band_pct = st.slider("Serva band %", 5, 25, 12, 1)
+            with cB:
+                edge_z_pct = st.slider("Serva Z %", 70, 99, 92, 1)
+            with cC:
+                bottom_z_pct = st.slider("Põhja Z %", 1, 20, 3, 1)
+            with cD:
+                min_pts = st.slider("Min punkte slice’is", 20, 300, 60, 10)
 
         if landxml and st.button("Salvesta LandXML & loe laius", use_container_width=True):
             prefix = project_prefix(p["name"]) + "landxml/"
             key = upload_file(s3, prefix, landxml)
+
             xml_bytes = download_bytes(s3, key)
 
-            top_w, valid = estimate_top_width_from_tin(
+            res = compute_cross_sections_every_5m(
                 xml_bytes,
-                n_bins=int(n_bins),
-                slice_thickness_ratio=float(slice_ratio),
-                edge_tail_pct=float(edge_tail),
+                step_m=float(step_m),
+                slice_thickness_m=float(slice_thickness_m),
+                edge_band_pct=float(edge_band_pct),
+                edge_z_pct=float(edge_z_pct),
+                bottom_z_pct=float(bottom_z_pct),
+                min_points_in_slice=int(min_pts),
             )
+
+            if not res:
+                # salvesta key DB-sse width None (või jäta vana alles)
+                set_project_top_width(p["id"], key, None)
+                st.warning("Ei suutnud TIN-ist ristlõikeid/pealmist laiust hinnata. Fail salvestati.")
+                st.rerun()
+
+            top_w = float(res.get("top_width_avg_m")) if res.get("top_width_avg_m") is not None else None
+            valid = len(res.get("sections", []))
+            axis_len = float(res.get("axis_length_m", 0.0))
 
             set_project_top_width(p["id"], key, top_w)
 
             if top_w is None:
-                st.warning("Ei suutnud TIN-ist pealmist laiust hinnata. Fail salvestati.")
+                st.warning(f"Ristlõiked leiti ({valid}), aga pealmist laiust ei saanud usaldusväärselt arvutada.")
             else:
                 st.success(f"Pealmine laius (EG–EG): ~ {top_w:.2f} m (valid slices: {valid})")
+                st.caption(f"TIN telje pikkus (auto): ~ {axis_len:.2f} m")
 
             st.rerun()
 
+        # Näita salvestatud tulemus
         if p.get("top_width_m") is not None:
             st.write(f"**TIN pealmine laius (EG–EG):** {float(p['top_width_m']):.2f} m")
         else:
