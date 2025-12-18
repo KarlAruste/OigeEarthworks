@@ -28,8 +28,6 @@ def init_db():
             created_at TIMESTAMPTZ DEFAULT now()
         );
         """)
-
-        # safe migrations for new fields
         conn.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS landxml_key TEXT;")
         conn.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS top_width_m DOUBLE PRECISION;")
 
@@ -45,7 +43,7 @@ def init_db():
         );
         """)
 
-        # ---- assignments ----
+        # ---- worker assignments ----
         conn.execute("""
         CREATE TABLE IF NOT EXISTS worker_assignments (
             id SERIAL PRIMARY KEY,
@@ -56,6 +54,28 @@ def init_db():
             note TEXT NULL,
             created_at TIMESTAMPTZ DEFAULT now(),
             CONSTRAINT assignment_dates CHECK (end_date >= start_date)
+        );
+        """)
+
+        # ---- tasks ----
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id SERIAL PRIMARY KEY,
+            project_id INT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            start_date DATE NULL,
+            end_date DATE NULL,
+            status TEXT NOT NULL DEFAULT 'todo',  -- todo | in_progress | done
+            created_at TIMESTAMPTZ DEFAULT now()
+        );
+        """)
+
+        # ---- task dependencies ----
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS task_deps (
+            task_id INT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            depends_on_task_id INT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            PRIMARY KEY (task_id, depends_on_task_id)
         );
         """)
 
@@ -88,7 +108,8 @@ def list_projects():
 def create_project(name: str, start_date=None, end_date=None):
     with get_conn() as conn:
         conn.execute(
-            "INSERT INTO projects (name, start_date, end_date) VALUES (%s, %s, %s) ON CONFLICT (name) DO NOTHING",
+            "INSERT INTO projects (name, start_date, end_date) VALUES (%s, %s, %s) "
+            "ON CONFLICT (name) DO NOTHING",
             (name.strip(), start_date, end_date),
         )
         conn.commit()
@@ -129,9 +150,8 @@ def add_worker(name: str, role: str = "", hourly: float = 0.0):
     name = (name or "").strip()
     role = (role or "").strip()
     hourly = float(hourly or 0.0)
-
     if not name:
-        raise ValueError("Worker name required.")
+        raise ValueError("Sisesta nimi.")
 
     with get_conn() as conn:
         conn.execute("""
@@ -167,9 +187,6 @@ def list_workers(active_only: bool = True):
     ]
 
 
-# =========================
-# Assignments (no double booking)
-# =========================
 def _worker_available(worker_id: int, start_date, end_date) -> bool:
     with get_conn() as conn:
         r = conn.execute("""
@@ -183,7 +200,7 @@ def _worker_available(worker_id: int, start_date, end_date) -> bool:
 
 def add_assignment(worker_id: int, project_id: int, start_date, end_date, note: str | None = None):
     if end_date < start_date:
-        raise ValueError("End date must be >= start date.")
+        raise ValueError("Lõpp peab olema >= algus.")
 
     if not _worker_available(worker_id, start_date, end_date):
         raise ValueError("Töötaja on juba broneeritud selles ajavahemikus.")
@@ -223,3 +240,118 @@ def list_assignments():
         }
         for r in rows
     ]
+
+
+# =========================
+# Tasks + Dependencies
+# =========================
+def add_task(project_id: int, name: str, start_date=None, end_date=None):
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("Sisesta töö nimetus.")
+
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT INTO tasks (project_id, name, start_date, end_date, status)
+            VALUES (%s, %s, %s, %s, 'todo')
+        """, (int(project_id), name, start_date, end_date))
+        conn.commit()
+
+
+def set_task_deps(task_id: int, dep_ids: list[int]):
+    dep_ids = [int(x) for x in dep_ids or []]
+    task_id = int(task_id)
+
+    with get_conn() as conn:
+        # wipe old deps
+        conn.execute("DELETE FROM task_deps WHERE task_id=%s", (task_id,))
+        # insert new deps
+        for d in dep_ids:
+            if d == task_id:
+                continue
+            conn.execute(
+                "INSERT INTO task_deps (task_id, depends_on_task_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                (task_id, int(d)),
+            )
+        conn.commit()
+
+
+def _deps_done(task_id: int) -> bool:
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT t.status
+            FROM task_deps d
+            JOIN tasks t ON t.id = d.depends_on_task_id
+            WHERE d.task_id=%s
+        """, (int(task_id),)).fetchall()
+
+    # if no deps -> ok
+    if not rows:
+        return True
+    # all must be done
+    return all((r[0] == "done") for r in rows)
+
+
+def set_task_status(task_id: int, status: str):
+    status = (status or "").strip()
+    if status not in ("todo", "in_progress", "done"):
+        raise ValueError("Invalid status.")
+
+    # block if deps not done
+    if status in ("in_progress", "done") and not _deps_done(task_id):
+        raise ValueError("Ei saa alustada/lõpetada — eeldustööd on tegemata (peavad olema DONE).")
+
+    with get_conn() as conn:
+        conn.execute("UPDATE tasks SET status=%s WHERE id=%s", (status, int(task_id)))
+        conn.commit()
+
+
+def list_tasks(project_id: int):
+    project_id = int(project_id)
+
+    with get_conn() as conn:
+        tasks = conn.execute("""
+            SELECT id, name, start_date, end_date, status
+            FROM tasks
+            WHERE project_id=%s
+            ORDER BY created_at ASC, id ASC
+        """, (project_id,)).fetchall()
+
+        # deps per task
+        deps = conn.execute("""
+            SELECT task_id, depends_on_task_id
+            FROM task_deps
+            WHERE task_id IN (SELECT id FROM tasks WHERE project_id=%s)
+        """, (project_id,)).fetchall()
+
+        deps_map = {}
+        for t_id, dep_id in deps:
+            deps_map.setdefault(t_id, []).append(dep_id)
+
+        # status for dep tasks (for blocked check)
+        status_map = {}
+        if tasks:
+            ids = tuple([t[0] for t in tasks])
+            if len(ids) == 1:
+                dep_rows = conn.execute("SELECT id, status FROM tasks WHERE id=%s", (ids[0],)).fetchall()
+            else:
+                dep_rows = conn.execute("SELECT id, status FROM tasks WHERE id IN %s", (ids,)).fetchall()
+            status_map = {r[0]: r[1] for r in dep_rows}
+
+    out = []
+    for (tid, name, start, end, status) in tasks:
+        dep_ids = deps_map.get(tid, [])
+        blocked = False
+        if dep_ids:
+            blocked = any(status_map.get(did) != "done" for did in dep_ids)
+
+        out.append({
+            "id": tid,
+            "name": name,
+            "start_date": start,
+            "end_date": end,
+            "status": status,
+            "deps": dep_ids,
+            "blocked": blocked,
+        })
+    return out
