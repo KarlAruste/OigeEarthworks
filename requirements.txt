@@ -7,3 +7,4 @@ matplotlib
 numpy
 plotly
 streamlit-plotly-events
+psycopg[binary]
