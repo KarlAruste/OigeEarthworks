@@ -1,41 +1,22 @@
-# views/projects_view.py
 import streamlit as st
 from datetime import date
-import numpy as np
 
-import plotly.graph_objects as go
-from streamlit_plotly_events import plotly_events
-
-from landxml import estimate_length_area_volume_from_tin, landxml_debug_views
-
-from db import (
-    list_projects,
-    create_project,
-    get_project,
-    set_project_landxml,
-    set_project_length,  # kui sul pole seda veel, anna märku
-)
-
+from db import list_projects, create_project, get_project, set_project_top_width
 from r2 import (
     get_s3,
     project_prefix,
     ensure_project_marker,
-    list_files,
     upload_file,
     download_bytes,
+    list_files,
     delete_key,
 )
+from landxml import estimate_top_width_from_tin
 
 
-def _polyline_length_m(points):
-    if len(points) < 2:
-        return 0.0
-    total = 0.0
-    for i in range(1, len(points)):
-        dx = points[i]["x"] - points[i - 1]["x"]
-        dy = points[i]["y"] - points[i - 1]["y"]
-        total += float((dx * dx + dy * dy) ** 0.5)
-    return float(total)
+def _area_trapezoid(depth: float, b: float, n: float) -> float:
+    # A = b*d + n*d^2 (trapeets: bottom=b, slopes 1:n)
+    return float(b * depth + n * depth * depth)
 
 
 def render_projects_view():
@@ -46,9 +27,6 @@ def render_projects_view():
 
     if "project_id" not in st.session_state:
         st.session_state["project_id"] = None
-
-    if "picked_points" not in st.session_state:
-        st.session_state["picked_points"] = []
 
     # ---------------- Create project ----------------
     st.markdown('<div class="block">', unsafe_allow_html=True)
@@ -86,7 +64,6 @@ def render_projects_view():
         for proj in projects:
             if st.button(proj["name"], use_container_width=True, key=f"projbtn_{proj['id']}"):
                 st.session_state["project_id"] = proj["id"]
-                st.session_state["picked_points"] = []  # reset polyline when switching projects
                 st.rerun()
 
     with right:
@@ -103,175 +80,92 @@ def render_projects_view():
         st.subheader(p["name"])
         st.caption(f"Tähtaeg: {p.get('end_date')}")
 
-        # Planned geometry summary
-        length = p.get("planned_length_m")
-        area = p.get("planned_area_m2")
-        vol = p.get("planned_volume_m3")
-
-        if length is not None:
-            st.write(f"**Pikkus:** {float(length):.2f} m")
-        if area is not None:
-            st.write(f"**Keskmine ristlõige:** {float(area):.2f} m²")
-
-        # kui tahad, näita maht arvutatult pikkus*ristlõige
-        if length is not None and area is not None:
-            st.write(f"**Planeeritud maht (arvutatud):** {float(length) * float(area):.1f} m³")
-        elif vol is not None:
-            st.write(f"**Planeeritud maht:** {float(vol):.1f} m³")
-        else:
-            st.info("Planeeritud maht puudub. Laadi LandXML üles.")
-
-        # ---------------- LandXML upload ----------------
+        # ---------------- LandXML upload (TOP WIDTH only) ----------------
         st.markdown('<div class="block">', unsafe_allow_html=True)
-        st.subheader("📄 LandXML (TIN -> pikkus/ristlõige/maht)")
+        st.subheader("📄 LandXML → pealmine laius (EG–EG)")
 
         landxml = st.file_uploader("Laadi üles LandXML (.xml)", type=["xml"], key="landxml_upload")
 
-        with st.expander("Arvutuse seaded (valikuline)"):
-            n_bins = st.slider("Lõigete arv", min_value=10, max_value=120, value=40, step=5)
+        with st.expander("Laiuse lugemise seaded (valikuline)"):
+            n_bins = st.slider("Slice arv", min_value=10, max_value=120, value=40, step=5)
             edge_tail = st.slider("Serva tail %", min_value=5, max_value=25, value=10, step=1)
-            slice_ratio = st.slider("Slice paksus (ratio %)", min_value=1, max_value=10, value=4, step=1) / 100.0
-            edge_z_pct = st.slider("Serva Z percentiil (kõrgus)", 90, 99, 97, 1)
-            fallback_top = st.slider("Fallback top %", 85, 99, 95, 1)
+            slice_ratio = st.slider("Slice paksus %", min_value=1, max_value=10, value=4, step=1) / 100.0
 
-        if landxml and st.button("Salvesta & arvuta", use_container_width=True):
+        if landxml and st.button("Salvesta LandXML & loe laius", use_container_width=True):
             prefix = project_prefix(p["name"]) + "landxml/"
             key = upload_file(s3, prefix, landxml)
             xml_bytes = download_bytes(s3, key)
 
-            length_m, area_m2, vol_m3 = estimate_length_area_volume_from_tin(
+            top_w, valid = estimate_top_width_from_tin(
                 xml_bytes,
                 n_bins=int(n_bins),
                 slice_thickness_ratio=float(slice_ratio),
                 edge_tail_pct=float(edge_tail),
-                edge_z_pct=float(edge_z_pct),
-                top_percentile_fallback=float(fallback_top),
             )
 
-            set_project_landxml(p["id"], key, vol_m3, length_m, area_m2)
+            set_project_top_width(p["id"], key, top_w)
 
-            if vol_m3 is None or area_m2 is None:
-                if length_m is not None:
-                    st.warning(
-                        f"TIN-ist ei suutnud kindlalt ristlõiget/mahtu hinnata. "
-                        f"Pikkus ~ {length_m:.1f} m. "
-                        "See tähendab tavaliselt, et servad pole selles pinnas "
-                        "või TIN on ainult kraavi põhi."
-                    )
-                else:
-                    st.warning("TIN-ist ei suutnud kindlalt ristlõiget/mahtu hinnata. Fail salvestati.")
+            if top_w is None:
+                st.warning("Ei suutnud TIN-ist pealmist laiust hinnata. Fail salvestati.")
             else:
-                st.success(
-                    f"Leitud: pikkus ~ {length_m:.2f} m, "
-                    f"ristlõige ~ {area_m2:.2f} m², "
-                    f"maht ~ {vol_m3:.1f} m³"
-                )
+                st.success(f"Pealmine laius (EG–EG): ~ {top_w:.2f} m (valid slices: {valid})")
 
-            st.session_state["picked_points"] = []  # reset after new landxml
             st.rerun()
+
+        if p.get("top_width_m") is not None:
+            st.write(f"**TIN pealmine laius (EG–EG):** {float(p['top_width_m']):.2f} m")
+        else:
+            st.info("Pealmine laius puudub. Laadi LandXML üles.")
 
         st.markdown("</div>", unsafe_allow_html=True)
 
-        # ---------------- 2D + polyline snap ----------------
+        # ---------------- Volume from user params ----------------
         st.markdown('<div class="block">', unsafe_allow_html=True)
-        st.subheader("👁 2D (zoom) + vali pikkus (polyline, snap TIN punktidele)")
+        st.subheader("🧮 Maht sinu parameetritest")
 
-        if p.get("landxml_key"):
-            xml_bytes = download_bytes(s3, p["landxml_key"])
-            dbg = landxml_debug_views(xml_bytes, sample_slices=3)
+        st.caption("Sisesta pikkus, põhi, nõlv ja sügavuse vahemik. Arvutame mahu (min/max/keskmine).")
 
-            if not dbg:
-                st.warning("Ei suutnud LandXML-ist 2D vaadet teha.")
-            else:
-                XY = dbg["pts_xy"]  # eeldus: X=Easting, Y=Northing
-                length_auto = dbg["length_m"]
+        c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+        with c1:
+            L = st.number_input("Pikkus L (m)", min_value=0.0, value=50.0, step=1.0)
+        with c2:
+            b = st.number_input("Põhja laius b (m)", min_value=0.0, value=0.4, step=0.1)
+        with c3:
+            slope_n = st.number_input("Nõlv 1:n (n)", min_value=0.1, value=2.0, step=0.1)
+        with c4:
+            d_min = st.number_input("Sügavus min (m)", min_value=0.0, value=1.5, step=0.1)
 
-                st.caption("Kliki punktid mööda kraavi. Iga klõps snäpib lähimale TIN punktile. Zoom: hiire rull, Pan: lohista.")
+        d_max = st.number_input("Sügavus max (m)", min_value=0.0, value=2.5, step=0.1)
 
-                fig = go.Figure()
-                fig.add_trace(go.Scattergl(
-                    x=XY[:, 0],
-                    y=XY[:, 1],
-                    mode="markers",
-                    marker=dict(size=3),
-                    name="TIN"
-                ))
-
-                # show chosen polyline
-                if st.session_state["picked_points"]:
-                    xs = [pt["x"] for pt in st.session_state["picked_points"]]
-                    ys = [pt["y"] for pt in st.session_state["picked_points"]]
-                    fig.add_trace(go.Scatter(
-                        x=xs,
-                        y=ys,
-                        mode="lines+markers",
-                        marker=dict(size=8),
-                        name="Valitud polyline"
-                    ))
-
-                fig.update_layout(
-                    height=520,
-                    margin=dict(l=10, r=10, t=40, b=10),
-                    title=f"TIN (auto pikkus ≈ {length_auto:.2f} m)",
-                    xaxis_title="Easting (m)",
-                    yaxis_title="Northing (m)",
-                )
-                fig.update_yaxes(scaleanchor="x", scaleratio=1)
-                fig.update_layout(dragmode="pan")
-
-                clicked = plotly_events(
-                    fig,
-                    click_event=True,
-                    select_event=False,
-                    hover_event=False,
-                    override_height=520,
-                    key="tin_poly_pick"
-                )
-
-                c1, c2, c3 = st.columns([1, 1, 2])
-                with c1:
-                    if st.button("🧹 Tühjenda valik", use_container_width=True):
-                        st.session_state["picked_points"] = []
-                        st.rerun()
-                with c2:
-                    if st.button("↩️ Undo viimane", use_container_width=True):
-                        if st.session_state["picked_points"]:
-                            st.session_state["picked_points"].pop()
-                            st.rerun()
-
-                # ADD clicked point with SNAP to nearest TIN point (A)
-                if clicked:
-                    pt = clicked[0]
-                    cx, cy = float(pt["x"]), float(pt["y"])
-
-                    dx = XY[:, 0] - cx
-                    dy = XY[:, 1] - cy
-                    idx = int(np.argmin(dx * dx + dy * dy))
-                    sx = float(XY[idx, 0])
-                    sy = float(XY[idx, 1])
-
-                    # avoid duplicates if clicking same spot
-                    if not st.session_state["picked_points"] or (
-                        abs(st.session_state["picked_points"][-1]["x"] - sx) > 0.001 or
-                        abs(st.session_state["picked_points"][-1]["y"] - sy) > 0.001
-                    ):
-                        st.session_state["picked_points"].append({"x": sx, "y": sy})
-
-                    st.rerun()
-
-                chosen_len = _polyline_length_m(st.session_state["picked_points"])
-                st.write(f"**Valitud pikkus:** {chosen_len:.2f} m (punktid: {len(st.session_state['picked_points'])})")
-
-                if st.button("💾 Salvesta valitud pikkus projekti", use_container_width=True):
-                    if chosen_len < 1.0:
-                        st.warning("Vali vähemalt 2 punkti, et pikkus tekiks.")
-                    else:
-                        set_project_length(p["id"], chosen_len)
-                        st.success("Pikkus salvestatud (planned_length_m).")
-                        st.rerun()
-
+        if d_max < d_min:
+            st.error("Sügavus max peab olema >= sügavus min.")
         else:
-            st.info("Laadi LandXML üles ja vajuta 'Salvesta & arvuta', et tekiks landxml_key.")
+            A_min = _area_trapezoid(d_min, b, slope_n)
+            A_max = _area_trapezoid(d_max, b, slope_n)
+            A_avg = (A_min + A_max) / 2.0
+
+            V_min = A_min * L
+            V_max = A_max * L
+            V_avg = A_avg * L
+
+            st.write(f"**Ristlõige min:** {A_min:.2f} m²")
+            st.write(f"**Ristlõige max:** {A_max:.2f} m²")
+            st.write(f"**Ristlõige keskmine:** {A_avg:.2f} m²")
+
+            st.write(f"**Maht min:** {V_min:.1f} m³")
+            st.write(f"**Maht max:** {V_max:.1f} m³")
+            st.write(f"**Maht keskmine:** {V_avg:.1f} m³")
+
+            # top width from params
+            T_min = b + 2.0 * slope_n * d_min
+            T_max = b + 2.0 * slope_n * d_max
+            st.caption(f"Sinu parameetritest pealmine laius: {T_min:.2f} – {T_max:.2f} m")
+
+            # compare with TIN top width
+            if p.get("top_width_m") is not None:
+                tw = float(p["top_width_m"])
+                if not (T_min <= tw <= T_max):
+                    st.warning("TIN pealmine laius ei jää sinu parameetrite vahemikku. Kontrolli b/n/d või TIN servi.")
 
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -299,11 +193,11 @@ def render_projects_view():
             return
 
         for f in files:
-            a, b, c = st.columns([6, 2, 2])
+            a, bcol, c = st.columns([6, 2, 2])
             with a:
                 st.write(f"📄 {f['name']}")
                 st.caption(f"{f['size'] / 1024:.1f} KB")
-            with b:
+            with bcol:
                 data = download_bytes(s3, f["key"])
                 st.download_button(
                     "⬇️ Laadi alla",
