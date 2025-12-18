@@ -1,4 +1,3 @@
-# landxml.py
 import xml.etree.ElementTree as ET
 import numpy as np
 
@@ -30,14 +29,14 @@ def estimate_top_width_from_tin(
 ):
     """
     Hinnang kraavi pealmisele laiusele (EG–EG) TIN-ist.
-    Tagastab (top_width_m, valid_slices)
+    Tagastab: (top_width_m, valid_slices)
 
     Meetod:
     - PCA -> peatelg (s)
     - risti telg (t)
-    - lõikame s suunas slice'ideks, ja igas slice'is võtame t-jaotuse äärmised tailid (vasak/parem serv)
-    - laius = median(t_right) - median(t_left)
-    - kokku tagastame mediaani üle slice'ide
+    - slice'ides võtame t-jaotuse vasaku/parema tail -> servad
+    - laius = median(right) - median(left)
+    - tagastame mediaani üle slice'ide
     """
     try:
         root = ET.fromstring(xml_bytes)
@@ -50,6 +49,7 @@ def estimate_top_width_from_tin(
 
     XY = pts[:, :2]
 
+    # PCA main direction
     XYc = XY - XY.mean(axis=0)
     cov = np.cov(XYc.T)
     eigvals, eigvecs = np.linalg.eigh(cov)
