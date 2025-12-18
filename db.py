@@ -18,7 +18,7 @@ def get_conn():
 
 def init_db():
     with get_conn() as conn:
-        # --- projects ---
+        # ---- projects ----
         conn.execute("""
         CREATE TABLE IF NOT EXISTS projects (
             id SERIAL PRIMARY KEY,
@@ -29,20 +29,23 @@ def init_db():
         );
         """)
 
-        # add columns if missing (safe migrations)
+        # safe migrations for new fields
         conn.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS landxml_key TEXT;")
         conn.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS top_width_m DOUBLE PRECISION;")
 
-        # --- workers ---
+        # ---- workers ----
         conn.execute("""
         CREATE TABLE IF NOT EXISTS workers (
             id SERIAL PRIMARY KEY,
             name TEXT UNIQUE NOT NULL,
+            role TEXT NULL,
+            hourly_rate DOUBLE PRECISION NOT NULL DEFAULT 0,
+            active BOOLEAN NOT NULL DEFAULT TRUE,
             created_at TIMESTAMPTZ DEFAULT now()
         );
         """)
 
-        # --- assignments / bookings ---
+        # ---- assignments ----
         conn.execute("""
         CREATE TABLE IF NOT EXISTS worker_assignments (
             id SERIAL PRIMARY KEY,
@@ -59,7 +62,9 @@ def init_db():
         conn.commit()
 
 
-# ---------------- Projects API ----------------
+# =========================
+# Projects
+# =========================
 def list_projects():
     with get_conn() as conn:
         rows = conn.execute("""
@@ -117,26 +122,59 @@ def set_project_top_width(project_id: int, landxml_key: str, top_width_m: float 
         conn.commit()
 
 
-# ---------------- Workers API (names match your workers_view.py) ----------------
-def add_worker(name: str):
+# =========================
+# Workers
+# =========================
+def add_worker(name: str, role: str = "", hourly: float = 0.0):
+    name = (name or "").strip()
+    role = (role or "").strip()
+    hourly = float(hourly or 0.0)
+
+    if not name:
+        raise ValueError("Worker name required.")
+
     with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO workers (name) VALUES (%s) ON CONFLICT (name) DO NOTHING",
-            (name.strip(),),
-        )
+        conn.execute("""
+            INSERT INTO workers (name, role, hourly_rate, active)
+            VALUES (%s, %s, %s, TRUE)
+            ON CONFLICT (name) DO UPDATE
+            SET role=EXCLUDED.role,
+                hourly_rate=EXCLUDED.hourly_rate,
+                active=TRUE
+        """, (name, role, hourly))
         conn.commit()
 
 
-def list_workers():
+def list_workers(active_only: bool = True):
     with get_conn() as conn:
-        rows = conn.execute("SELECT id, name FROM workers ORDER BY name ASC").fetchall()
-    return [{"id": r[0], "name": r[1]} for r in rows]
+        if active_only:
+            rows = conn.execute("""
+                SELECT id, name, role, hourly_rate, active
+                FROM workers
+                WHERE active=TRUE
+                ORDER BY name ASC
+            """).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT id, name, role, hourly_rate, active
+                FROM workers
+                ORDER BY name ASC
+            """).fetchall()
+
+    return [
+        {"id": r[0], "name": r[1], "role": r[2], "hourly_rate": r[3], "active": r[4]}
+        for r in rows
+    ]
 
 
+# =========================
+# Assignments (no double booking)
+# =========================
 def _worker_available(worker_id: int, start_date, end_date) -> bool:
     with get_conn() as conn:
         r = conn.execute("""
-            SELECT COUNT(*) FROM worker_assignments
+            SELECT COUNT(*)
+            FROM worker_assignments
             WHERE worker_id=%s
               AND NOT (end_date < %s OR start_date > %s)
         """, (int(worker_id), start_date, end_date)).fetchone()
@@ -144,7 +182,9 @@ def _worker_available(worker_id: int, start_date, end_date) -> bool:
 
 
 def add_assignment(worker_id: int, project_id: int, start_date, end_date, note: str | None = None):
-    # prevents double booking
+    if end_date < start_date:
+        raise ValueError("End date must be >= start date.")
+
     if not _worker_available(worker_id, start_date, end_date):
         raise ValueError("Töötaja on juba broneeritud selles ajavahemikus.")
 
@@ -159,18 +199,24 @@ def add_assignment(worker_id: int, project_id: int, start_date, end_date, note: 
 def list_assignments():
     with get_conn() as conn:
         rows = conn.execute("""
-            SELECT wa.id, w.name, p.name, wa.start_date, wa.end_date, wa.note
+            SELECT
+                wa.id,
+                w.name AS worker_name,
+                p.name AS project_name,
+                wa.start_date,
+                wa.end_date,
+                wa.note
             FROM worker_assignments wa
             JOIN workers w ON w.id = wa.worker_id
             JOIN projects p ON p.id = wa.project_id
-            ORDER BY wa.start_date DESC
+            ORDER BY wa.start_date DESC, wa.id DESC
         """).fetchall()
 
     return [
         {
             "id": r[0],
-            "worker": r[1],
-            "project": r[2],
+            "worker_name": r[1],
+            "project_name": r[2],
             "start_date": r[3],
             "end_date": r[4],
             "note": r[5],
