@@ -1,34 +1,26 @@
 import streamlit as st
-from db import list_projects, add_task, list_tasks, set_task_deps, set_task_status
+from db import get_project, add_task, list_tasks, set_task_deps, set_task_status
 
 def render_tasks_view():
     st.title("Tasks + eeldustööd")
 
-    projects = list_projects()
-    if not projects:
-        st.info("Loo enne projekt (Projects lehel).")
+    project_id = st.session_state.get("active_project_id")
+    if not project_id:
+        st.info("Vali enne projekt (Projects lehel).")
         return
 
-    project_id = st.selectbox(
-        "Vali projekt",
-        options=[p["id"] for p in projects],
-        format_func=lambda pid: next(x["name"] for x in projects if x["id"] == pid),
-    )
+    p = get_project(project_id)
+    st.caption(f"Aktiivne projekt: **{p['name']}**")
 
     st.markdown('<div class="block">', unsafe_allow_html=True)
     st.subheader("➕ Lisa töö")
     name = st.text_input("Töö nimetus", placeholder="nt Freesimine / Asfalt / Haljastus")
-    c1,c2 = st.columns([1,1])
-    with c1:
-        start = st.date_input("Algus (valikuline)", value=None)
-    with c2:
-        end = st.date_input("Lõpp (valikuline)", value=None)
 
     if st.button("Lisa töö", use_container_width=True):
         if not name.strip():
             st.warning("Sisesta töö nimetus.")
         else:
-            add_task(project_id, name.strip(), start, end)
+            add_task(project_id, name.strip())
             st.success("Lisatud.")
             st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
@@ -38,6 +30,7 @@ def render_tasks_view():
         st.info("Lisa töid.")
         return
 
+    st.markdown('<div class="block">', unsafe_allow_html=True)
     st.subheader("🔗 Eeldustööd")
     task_id = st.selectbox(
         "Vali töö, millele määrad eeldused",
@@ -57,9 +50,11 @@ def render_tasks_view():
         st.success("Eeldused salvestatud.")
         st.rerun()
 
-    st.subheader("📋 Tööd")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    st.subheader("📋 Tööd (ainult see projekt)")
     for t in tasks:
-        blocked = t["blocked"] and t["status"] != "done"
+        blocked = t.get("blocked", False) and t.get("status") != "done"
         tag = "🔴 BLOKEERITUD" if blocked else "🟢 OK"
         st.write(f"**{t['name']}** • {t['status']} • {tag}")
 
