@@ -21,7 +21,9 @@ def get_conn():
 
 def init_db():
     with get_conn() as conn:
-        # ---- projects ----
+        # =====================
+        # projects
+        # =====================
         conn.execute("""
         CREATE TABLE IF NOT EXISTS projects (
             id SERIAL PRIMARY KEY,
@@ -33,9 +35,11 @@ def init_db():
         """)
         conn.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS landxml_key TEXT;")
         conn.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS top_width_m DOUBLE PRECISION;")
+        conn.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();")
 
-        # ---- workers ----
-        # Create table if it does not exist
+        # =====================
+        # workers
+        # =====================
         conn.execute("""
         CREATE TABLE IF NOT EXISTS workers (
             id SERIAL PRIMARY KEY,
@@ -46,32 +50,14 @@ def init_db():
         );
         """)
 
-        # ✅ MIGRATIONS for existing DBs (Render / production)
-        # Ensure required columns exist even if table was created earlier
         conn.execute("ALTER TABLE workers ADD COLUMN IF NOT EXISTS role TEXT;")
         conn.execute("ALTER TABLE workers ADD COLUMN IF NOT EXISTS hourly_rate DOUBLE PRECISION NOT NULL DEFAULT 0;")
         conn.execute("ALTER TABLE workers ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE;")
         conn.execute("ALTER TABLE workers ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();")
 
-        # Optional: if you previously used another column name (hourly), copy it over once.
-        # Safe: does nothing if hourly column doesn't exist.
-        conn.execute("""
-        DO $$
-        BEGIN
-            IF EXISTS (
-                SELECT 1 FROM information_schema.columns
-                WHERE table_name='workers' AND column_name='hourly'
-            ) AND NOT EXISTS (
-                SELECT 1 FROM information_schema.columns
-                WHERE table_name='workers' AND column_name='hourly_rate'
-            ) THEN
-                ALTER TABLE workers ADD COLUMN hourly_rate DOUBLE PRECISION NOT NULL DEFAULT 0;
-                EXECUTE 'UPDATE workers SET hourly_rate = COALESCE(hourly, 0)';
-            END IF;
-        END $$;
-        """)
-
-        # ---- worker assignments ----
+        # =====================
+        # worker_assignments
+        # =====================
         conn.execute("""
         CREATE TABLE IF NOT EXISTS worker_assignments (
             id SERIAL PRIMARY KEY,
@@ -85,20 +71,27 @@ def init_db():
         );
         """)
 
-        # ---- tasks ----
+        conn.execute("ALTER TABLE worker_assignments ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();")
+
+        # =====================
+        # tasks
+        # =====================
         conn.execute("""
         CREATE TABLE IF NOT EXISTS tasks (
             id SERIAL PRIMARY KEY,
             project_id INT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-            name TEXT NOT NULL,
-            start_date DATE NULL,
-            end_date DATE NULL,
-            status TEXT NOT NULL DEFAULT 'todo',  -- todo | in_progress | done
-            created_at TIMESTAMPTZ DEFAULT now()
+            name TEXT NOT NULL
         );
         """)
 
-        # ---- task dependencies ----
+        conn.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS start_date DATE;")
+        conn.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS end_date DATE;")
+        conn.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'todo';")
+        conn.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();")
+
+        # =====================
+        # task dependencies
+        # =====================
         conn.execute("""
         CREATE TABLE IF NOT EXISTS task_deps (
             task_id INT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -107,7 +100,9 @@ def init_db():
         );
         """)
 
-        # ---- cost items ----
+        # =====================
+        # cost items
+        # =====================
         conn.execute("""
         CREATE TABLE IF NOT EXISTS cost_items (
             id SERIAL PRIMARY KEY,
@@ -117,8 +112,11 @@ def init_db():
             created_at TIMESTAMPTZ DEFAULT now()
         );
         """)
+        conn.execute("ALTER TABLE cost_items ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();")
 
-        # ---- production (costs by work done) ----
+        # =====================
+        # production
+        # =====================
         conn.execute("""
         CREATE TABLE IF NOT EXISTS production (
             id SERIAL PRIMARY KEY,
@@ -130,8 +128,11 @@ def init_db():
             created_at TIMESTAMPTZ DEFAULT now()
         );
         """)
+        conn.execute("ALTER TABLE production ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();")
 
-        # ---- revenue ----
+        # =====================
+        # revenue
+        # =====================
         conn.execute("""
         CREATE TABLE IF NOT EXISTS revenue (
             id SERIAL PRIMARY KEY,
@@ -142,8 +143,10 @@ def init_db():
             created_at TIMESTAMPTZ DEFAULT now()
         );
         """)
+        conn.execute("ALTER TABLE revenue ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();")
 
         conn.commit()
+
 
 
 # =========================
