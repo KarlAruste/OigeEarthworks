@@ -1,132 +1,317 @@
-import streamlit as st
-from db import (
-    list_projects,
-    add_task,
-    list_tasks,
-    set_task_deps,
-    set_task_status,
-    delete_task,
-    list_task_deps,
-    delete_task_dep,
-)
+# db.py
+import os
+import psycopg2
+import psycopg2.extras
+from contextlib import contextmanager
+from datetime import date
 
-def render_tasks_view():
-    st.title("Tasks + eeldustööd")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-    projects = list_projects()
-    if not projects:
-        st.info("Loo enne projekt (Projects lehel).")
-        return
+# ---------- connection helpers ----------
 
-    # Kui sul on aktiivne projekt session_state-s, kasuta seda
-    default_pid = st.session_state.get("project_id")
-    project_ids = [p["id"] for p in projects]
-    if default_pid not in project_ids:
-        default_pid = project_ids[0]
+@contextmanager
+def get_conn():
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
-    project_id = st.selectbox(
-        "Aktiivne projekt",
-        options=project_ids,
-        index=project_ids.index(default_pid),
-        format_func=lambda pid: next(x["name"] for x in projects if x["id"] == pid),
-    )
 
-    st.caption(f"Aktiivne projekt: {next(x['name'] for x in projects if x['id']==project_id)}")
+def init_db():
+    with get_conn() as conn:
+        cur = conn.cursor()
 
-    # ---------------- Add task ----------------
-    st.markdown('<div class="block">', unsafe_allow_html=True)
-    st.subheader("➕ Lisa töö")
-    name = st.text_input("Töö nimetus", placeholder="nt Freesimine / Asfalt / Haljastus")
+        # projects
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS projects (
+            id SERIAL PRIMARY KEY,
+            name TEXT UNIQUE NOT NULL,
+            start_date DATE,
+            end_date DATE,
+            landxml_key TEXT,
+            top_width_m DOUBLE PRECISION
+        );
+        """)
 
-    if st.button("Lisa töö", use_container_width=True):
-        if not name.strip():
-            st.warning("Sisesta töö nimetus.")
+        # workers
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS workers (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            role TEXT,
+            hourly_rate DOUBLE PRECISION,
+            active BOOLEAN DEFAULT TRUE
+        );
+        """)
+
+        # assignments (worker ↔ project)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS assignments (
+            id SERIAL PRIMARY KEY,
+            worker_id INTEGER REFERENCES workers(id) ON DELETE CASCADE,
+            project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+            start_date DATE NOT NULL,
+            end_date DATE NOT NULL,
+            note TEXT
+        );
+        """)
+
+        # tasks
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id SERIAL PRIMARY KEY,
+            project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            start_date DATE,
+            end_date DATE,
+            status TEXT DEFAULT 'planned'
+        );
+        """)
+
+        # task dependencies
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS task_deps (
+            task_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+            dep_task_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+            PRIMARY KEY (task_id, dep_task_id)
+        );
+        """)
+
+        # cost items
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS cost_items (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            unit TEXT NOT NULL,
+            unit_price DOUBLE PRECISION NOT NULL
+        );
+        """)
+
+        # production (costs)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS production (
+            id SERIAL PRIMARY KEY,
+            project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+            cost_item_id INTEGER REFERENCES cost_items(id),
+            qty DOUBLE PRECISION,
+            work_date DATE,
+            note TEXT
+        );
+        """)
+
+        # revenue
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS revenue (
+            id SERIAL PRIMARY KEY,
+            project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+            amount DOUBLE PRECISION,
+            rev_date DATE,
+            note TEXT
+        );
+        """)
+
+
+# ---------- projects ----------
+
+def list_projects():
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT * FROM projects ORDER BY name;")
+        return cur.fetchall()
+
+
+def create_project(name, start_date=None, end_date=None):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO projects (name, start_date, end_date) VALUES (%s,%s,%s)",
+            (name, start_date, end_date),
+        )
+
+
+def get_project(project_id):
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT * FROM projects WHERE id=%s", (project_id,))
+        return cur.fetchone()
+
+
+def set_project_top_width(project_id, landxml_key, top_width):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE projects SET landxml_key=%s, top_width_m=%s WHERE id=%s",
+            (landxml_key, top_width, project_id),
+        )
+
+
+# ---------- workers ----------
+
+def add_worker(name, role, hourly):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO workers (name, role, hourly_rate) VALUES (%s,%s,%s)",
+            (name, role, hourly),
+        )
+
+
+def list_workers(active_only=True):
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        if active_only:
+            cur.execute("SELECT * FROM workers WHERE active=TRUE ORDER BY name;")
         else:
-            add_task(project_id, name.strip())
-            st.success("Lisatud.")
-            st.rerun()
-    st.markdown("</div>", unsafe_allow_html=True)
+            cur.execute("SELECT * FROM workers ORDER BY name;")
+        return cur.fetchall()
 
-    tasks = list_tasks(project_id)
-    if not tasks:
-        st.info("Lisa töid.")
-        return
 
-    # ---------------- Dependencies editor ----------------
-    st.markdown('<div class="block">', unsafe_allow_html=True)
-    st.subheader("🔗 Eeldustööd")
+# ---------- assignments ----------
 
-    task_id = st.selectbox(
-        "Vali töö, millele määrad eeldused",
-        options=[t["id"] for t in tasks],
-        format_func=lambda tid: next(x["name"] for x in tasks if x["id"] == tid),
-    )
+def add_assignment(worker_id, project_id, start, end, note):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        # prevent double booking
+        cur.execute("""
+        SELECT 1 FROM assignments
+        WHERE worker_id=%s
+          AND NOT (end_date < %s OR start_date > %s)
+        """, (worker_id, start, end))
+        if cur.fetchone():
+            raise Exception("Töötaja on sel perioodil juba broneeritud.")
 
-    dep_options = [t for t in tasks if t["id"] != task_id]
-    dep_ids = st.multiselect(
-        "Vali eeldustööd (need peavad olema DONE)",
-        options=[t["id"] for t in dep_options],
-        format_func=lambda tid: next(x["name"] for x in dep_options if x["id"] == tid),
-    )
+        cur.execute("""
+        INSERT INTO assignments (worker_id, project_id, start_date, end_date, note)
+        VALUES (%s,%s,%s,%s,%s)
+        """, (worker_id, project_id, start, end, note))
 
-    cA, cB = st.columns([1, 1])
-    with cA:
-        if st.button("Salvesta eeldused", use_container_width=True):
-            set_task_deps(task_id, dep_ids)
-            st.success("Eeldused salvestatud.")
-            st.rerun()
 
-    with cB:
-        if st.button("Eemalda kõik eeldused", use_container_width=True):
-            set_task_deps(task_id, [])
-            st.success("Eeldused eemaldatud.")
-            st.rerun()
+def list_assignments():
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+        SELECT a.*, w.name AS worker_name, p.name AS project_name
+        FROM assignments a
+        JOIN workers w ON w.id=a.worker_id
+        JOIN projects p ON p.id=a.project_id
+        ORDER BY a.start_date DESC
+        """)
+        return cur.fetchall()
 
-    # olemasolevad eeldused + remove one-by-one
-    deps = list_task_deps(task_id)
-    if deps:
-        st.write("**Selle töö eeldused:**")
-        for d in deps:
-            row1, row2 = st.columns([6, 2])
-            with row1:
-                st.write(f"- {d['name']} ({d['status']})")
-            with row2:
-                if st.button("❌ Eemalda", key=f"rmdep_{task_id}_{d['dep_task_id']}", use_container_width=True):
-                    delete_task_dep(task_id, d["dep_task_id"])
-                    st.rerun()
-    else:
-        st.caption("Eeldusi pole.")
 
-    st.markdown("</div>", unsafe_allow_html=True)
+# ---------- tasks ----------
 
-    # ---------------- Task list ----------------
-    st.subheader("📋 Tööd (ainult see projekt)")
+def add_task(project_id, name, start=None, end=None):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO tasks (project_id, name, start_date, end_date) VALUES (%s,%s,%s,%s)",
+            (project_id, name, start, end),
+        )
 
-    for t in tasks:
-        blocked = t.get("blocked") and t["status"] != "done"
-        tag = "🔴 BLOKEERITUD" if blocked else "🟢 OK"
-        st.write(f"**{t['name']}** • {t['status']} • {tag}")
 
-        c1, c2, c3 = st.columns([1, 1, 1])
-        with c1:
-            if st.button("Start", key=f"start_{t['id']}", use_container_width=True):
-                try:
-                    set_task_status(t["id"], "in_progress")
-                    st.rerun()
-                except Exception as e:
-                    st.error(str(e))
+def delete_task(task_id):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM tasks WHERE id=%s", (task_id,))
 
-        with c2:
-            if st.button("Done", key=f"done_{t['id']}", use_container_width=True):
-                try:
-                    set_task_status(t["id"], "done")
-                    st.rerun()
-                except Exception as e:
-                    st.error(str(e))
 
-        with c3:
-            if st.button("🗑️ Kustuta", key=f"del_{t['id']}", use_container_width=True):
-                delete_task(t["id"])
-                st.rerun()
+def list_tasks(project_id):
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-        st.divider()
+        cur.execute("""
+        SELECT t.*,
+          EXISTS (
+            SELECT 1 FROM task_deps d
+            JOIN tasks td ON td.id=d.dep_task_id
+            WHERE d.task_id=t.id AND td.status!='done'
+          ) AS blocked
+        FROM tasks t
+        WHERE t.project_id=%s
+        ORDER BY t.id
+        """, (project_id,))
+        return cur.fetchall()
+
+
+def set_task_deps(task_id, dep_ids):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM task_deps WHERE task_id=%s", (task_id,))
+        for d in dep_ids:
+            cur.execute(
+                "INSERT INTO task_deps (task_id, dep_task_id) VALUES (%s,%s)",
+                (task_id, d),
+            )
+
+
+def set_task_status(task_id, status):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE tasks SET status=%s WHERE id=%s",
+            (status, task_id),
+        )
+
+
+# ---------- cost & reports ----------
+
+def list_cost_items():
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT * FROM cost_items ORDER BY name")
+        return cur.fetchall()
+
+
+def add_cost_item(name, unit, price):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO cost_items (name, unit, unit_price) VALUES (%s,%s,%s)",
+            (name, unit, price),
+        )
+
+
+def add_production(project_id, cost_item_id, qty, work_date, note):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+        INSERT INTO production (project_id, cost_item_id, qty, work_date, note)
+        VALUES (%s,%s,%s,%s,%s)
+        """, (project_id, cost_item_id, qty, work_date, note))
+
+
+def add_revenue(project_id, amount, rev_date, note):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+        INSERT INTO revenue (project_id, amount, rev_date, note)
+        VALUES (%s,%s,%s,%s)
+        """, (project_id, amount, rev_date, note))
+
+
+def daily_profit_series(project_id):
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+        SELECT d::date AS date,
+               COALESCE(SUM(r.amount),0) AS revenue,
+               COALESCE(SUM(p.qty*c.unit_price),0) AS cost,
+               COALESCE(SUM(r.amount),0) - COALESCE(SUM(p.qty*c.unit_price),0) AS profit
+        FROM generate_series(
+            (SELECT MIN(work_date) FROM production WHERE project_id=%s),
+            CURRENT_DATE,
+            INTERVAL '1 day'
+        ) d
+        LEFT JOIN production p ON p.work_date=d AND p.project_id=%s
+        LEFT JOIN cost_items c ON c.id=p.cost_item_id
+        LEFT JOIN revenue r ON r.rev_date=d AND r.project_id=%s
+        GROUP BY d
+        ORDER BY d
+        """, (project_id, project_id, project_id))
+        return cur.fetchall()
