@@ -324,19 +324,42 @@ def list_tasks(project_id: int):
             """, (project_id,))
             tasks = cur.fetchall()
 
-        # compute "blocked" for each task
+        # detect dep column name once
+        with conn.cursor() as curc:
+            curc.execute("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name='task_deps'
+            """)
+            cols = {r[0] for r in curc.fetchall()}
+
+        # choose dep column
+        dep_col = None
+        if "dep_task_id" in cols:
+            dep_col = "dep_task_id"
+        elif "dep_task_id_id" in cols:
+            dep_col = "dep_task_id_id"
+        elif "dep_id" in cols:
+            dep_col = "dep_id"
+
+        if dep_col is None:
+            # if task_deps table exists but schema is unknown
+            for t in tasks:
+                t["blocked"] = False
+            return tasks
+
         with conn.cursor(cursor_factory=RealDictCursor) as cur2:
             for t in tasks:
-                cur2.execute("""
+                cur2.execute(f"""
                     SELECT COUNT(*) AS missing
                     FROM task_deps d
-                    JOIN tasks dep ON dep.id=d.dep_task_id
+                    JOIN tasks dep ON dep.id=d.{dep_col}
                     WHERE d.task_id=%s AND dep.status <> 'done'
                 """, (t["id"],))
                 missing = int(cur2.fetchone()["missing"])
                 t["blocked"] = (missing > 0)
-        return tasks
 
+        return tasks
 
 # -----------------------------
 # Cost items (global)
