@@ -65,11 +65,11 @@ def render_projects_view():
         st.caption("Vali projekt:")
         for proj in projects:
             if st.button(proj["name"], use_container_width=True, key=f"projbtn_{proj['id']}"):
-                st.session_state["project_id"] = proj["id"]
+                st.session_state["active_project_id"] = proj["id"]
                 st.rerun()
 
     with right:
-        pid = st.session_state.get("project_id")
+        pid = st.session_state.get("active_project_id")
         if not pid:
             st.info("Vali vasakult projekt.")
             return
