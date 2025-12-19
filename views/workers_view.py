@@ -1,28 +1,26 @@
 import streamlit as st
 from datetime import date, timedelta
+
 from db import (
     list_projects,
     add_worker,
     list_workers,
     add_assignment,
-    list_assignments_by_project,
-    get_project,
+    list_assignments,
 )
 
 def render_workers_view():
     st.title("Workers & Assignments")
 
-    project_id = st.session_state.get("active_project_id")
-    if not project_id:
-        st.info("Vali enne projekt (Projects lehel).")
+    projects = list_projects()
+    if not projects:
+        st.info("Loo enne projekt (Projects lehel).")
         return
-
-    p = get_project(project_id)
-    st.caption(f"Aktiivne projekt: **{p['name']}**")
 
     st.markdown('<div class="block">', unsafe_allow_html=True)
     st.subheader("➕ Lisa töötaja")
-    c1,c2,c3 = st.columns([2,2,1])
+
+    c1, c2, c3 = st.columns([2, 2, 1])
     with c1:
         name = st.text_input("Nimi", placeholder="nt Mari Maasikas")
     with c2:
@@ -37,15 +35,14 @@ def render_workers_view():
             add_worker(name.strip(), role.strip(), hourly)
             st.success("Lisatud.")
             st.rerun()
-    st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
     workers = list_workers(active_only=True)
     if not workers:
         st.info("Lisa vähemalt üks töötaja.")
         return
 
-    st.markdown('<div class="block">', unsafe_allow_html=True)
-    st.subheader("📅 Broneeri töötaja aktiivsele projektile (topeltbroneering keelatud)")
+    st.subheader("📅 Broneeri töötaja projektile (topeltbroneering keelatud)")
 
     worker_id = st.selectbox(
         "Töötaja",
@@ -53,7 +50,19 @@ def render_workers_view():
         format_func=lambda wid: next(x["name"] for x in workers if x["id"] == wid),
     )
 
-    d1,d2 = st.columns([1,1])
+    project_ids = [p["id"] for p in projects]
+    default_pid = st.session_state.get("project_id")
+    if default_pid not in project_ids:
+        default_pid = project_ids[0]
+
+    project_id = st.selectbox(
+        "Projekt",
+        options=project_ids,
+        index=project_ids.index(default_pid),
+        format_func=lambda pid: next(x["name"] for x in projects if x["id"] == pid),
+    )
+
+    d1, d2 = st.columns([1, 1])
     with d1:
         start = st.date_input("Algus", value=date.today())
     with d2:
@@ -69,13 +78,14 @@ def render_workers_view():
         except Exception as e:
             st.error(str(e))
 
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    st.subheader("📌 Broneeringud (ainult see projekt)")
-    rows = list_assignments_by_project(project_id)
+    st.subheader("📌 Broneeringud (kõik projektid)")
+    rows = list_assignments()
     if not rows:
-        st.info("Sellel projektil broneeringuid pole.")
+        st.info("Broneeringuid pole.")
         return
 
     for r in rows[:300]:
-        st.write(f"**{r['worker_name']}** • {r['start_date']} .. {r['end_date']}  —  {r.get('note','') or ''}")
+        st.write(
+            f"**{r['worker_name']}** → {r['project_name']} • "
+            f"{r['start_date']} .. {r['end_date']} — {r.get('note','') or ''}"
+        )
