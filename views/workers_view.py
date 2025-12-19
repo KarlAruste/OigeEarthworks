@@ -1,14 +1,24 @@
 import streamlit as st
 from datetime import date, timedelta
-from db import list_projects, add_worker, list_workers, add_assignment, list_assignments
+from db import (
+    list_projects,
+    add_worker,
+    list_workers,
+    add_assignment,
+    list_assignments_by_project,
+    get_project,
+)
 
 def render_workers_view():
     st.title("Workers & Assignments")
 
-    projects = list_projects()
-    if not projects:
-        st.info("Loo enne projekt (Projects lehel).")
+    project_id = st.session_state.get("active_project_id")
+    if not project_id:
+        st.info("Vali enne projekt (Projects lehel).")
         return
+
+    p = get_project(project_id)
+    st.caption(f"Aktiivne projekt: **{p['name']}**")
 
     st.markdown('<div class="block">', unsafe_allow_html=True)
     st.subheader("➕ Lisa töötaja")
@@ -34,18 +44,13 @@ def render_workers_view():
         st.info("Lisa vähemalt üks töötaja.")
         return
 
-    st.subheader("📅 Broneeri töötaja projektile (topeltbroneering keelatud)")
+    st.markdown('<div class="block">', unsafe_allow_html=True)
+    st.subheader("📅 Broneeri töötaja aktiivsele projektile (topeltbroneering keelatud)")
 
     worker_id = st.selectbox(
         "Töötaja",
         options=[w["id"] for w in workers],
         format_func=lambda wid: next(x["name"] for x in workers if x["id"] == wid),
-    )
-
-    project_id = st.selectbox(
-        "Projekt",
-        options=[p["id"] for p in projects],
-        format_func=lambda pid: next(x["name"] for x in projects if x["id"] == pid),
     )
 
     d1,d2 = st.columns([1,1])
@@ -64,11 +69,13 @@ def render_workers_view():
         except Exception as e:
             st.error(str(e))
 
-    st.subheader("📌 Broneeringud")
-    rows = list_assignments()
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    st.subheader("📌 Broneeringud (ainult see projekt)")
+    rows = list_assignments_by_project(project_id)
     if not rows:
-        st.info("Broneeringuid pole.")
+        st.info("Sellel projektil broneeringuid pole.")
         return
 
-    for r in rows[:200]:
-        st.write(f"**{r['worker_name']}** → {r['project_name']} • {r['start_date']} .. {r['end_date']}  —  {r.get('note','') or ''}")
+    for r in rows[:300]:
+        st.write(f"**{r['worker_name']}** • {r['start_date']} .. {r['end_date']}  —  {r.get('note','') or ''}")
