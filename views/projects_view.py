@@ -7,7 +7,7 @@ import plotly.graph_objects as go
 
 from db import (
     list_projects, create_project, get_project,
-    set_project_top_width, set_project_landxml
+    set_project_landxml
 )
 from r2 import (
     get_s3,
@@ -19,20 +19,13 @@ from r2 import (
     delete_key,
 )
 
-# UUS: TIN + telg + PK tabel
 from landxml import (
     read_landxml_tin_from_bytes,
     compute_pk_table_from_landxml,
     polyline_length,
 )
 
-# Click-eventide jaoks
 from streamlit_plotly_events import plotly_events
-
-
-def _area_trapezoid(depth: float, b: float, n: float) -> float:
-    # A = b*d + n*d^2 (trapeets: bottom=b, slopes 1:n)
-    return float(b * depth + n * depth * depth)
 
 
 def _downsample_points(xyz: np.ndarray, max_pts: int = 50000) -> np.ndarray:
@@ -42,7 +35,7 @@ def _downsample_points(xyz: np.ndarray, max_pts: int = 50000) -> np.ndarray:
     return xyz[idx]
 
 
-def _make_tin_figure(xyz_show: np.ndarray, axis_xy, finished: bool):
+def _make_tin_figure(xyz_show: np.ndarray, axis_xy):
     fig = go.Figure()
 
     fig.add_trace(go.Scattergl(
@@ -65,7 +58,6 @@ def _make_tin_figure(xyz_show: np.ndarray, axis_xy, finished: bool):
             name="Telg"
         ))
 
-        # näita pikkus tekstina (plotile)
         L = polyline_length(axis_xy)
         fig.add_annotation(
             x=xs[-1], y=ys[-1],
@@ -80,13 +72,12 @@ def _make_tin_figure(xyz_show: np.ndarray, axis_xy, finished: bool):
         margin=dict(l=10, r=10, t=40, b=10),
         title="Pealtvaade (kliki punkte telje joonistamiseks)",
         legend=dict(orientation="h"),
-        dragmode="pan",   # pan default (zoom toolbarist)
-        uirevision="keep" # hoiab zoom/pan alles rerun'idel
+        dragmode="pan",
+        uirevision="keep"
     )
     fig.update_yaxes(scaleanchor="x", scaleratio=1)
     fig.update_xaxes(title="X")
     fig.update_yaxes(title="Y")
-
     return fig
 
 
@@ -96,23 +87,20 @@ def render_projects_view():
     s3 = get_s3()
     projects = list_projects()
 
-    # session state init
     if "active_project_id" not in st.session_state:
         st.session_state["active_project_id"] = None
 
-    # telje/session state
     if "axis_xy" not in st.session_state:
         st.session_state["axis_xy"] = []
     if "axis_finished" not in st.session_state:
         st.session_state["axis_finished"] = False
 
-    # LandXML bytes sessionis (et ei peaks iga kord R2-st võtma)
     if "landxml_bytes" not in st.session_state:
         st.session_state["landxml_bytes"] = None
     if "landxml_key" not in st.session_state:
         st.session_state["landxml_key"] = None
 
-    # --------------- Create project ---------------
+    # ---------------- Create project ----------------
     st.markdown('<div class="block">', unsafe_allow_html=True)
     st.subheader("➕ Loo projekt")
 
@@ -135,7 +123,7 @@ def render_projects_view():
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # --------------- Project list ---------------
+    # ---------------- Project list ----------------
     st.subheader("📌 Minu projektid")
     if not projects:
         st.info("Pole veel projekte.")
@@ -148,7 +136,6 @@ def render_projects_view():
         for proj in projects:
             if st.button(proj["name"], use_container_width=True, key=f"projbtn_{proj['id']}"):
                 st.session_state["active_project_id"] = proj["id"]
-                # reset telg ja landxml sessioon, et ei segaks teise projektiga
                 st.session_state["axis_xy"] = []
                 st.session_state["axis_finished"] = False
                 st.session_state["landxml_bytes"] = None
@@ -169,9 +156,7 @@ def render_projects_view():
         st.subheader(p["name"])
         st.caption(f"Tähtaeg: {p.get('end_date')}")
 
-        # ============================================================
-        # 1) LandXML upload (salvesta R2 + sessionisse bytes)
-        # ============================================================
+        # ---------------- LandXML upload ----------------
         st.markdown('<div class="block">', unsafe_allow_html=True)
         st.subheader("📄 LandXML → salvesta ja lae mudel")
 
@@ -184,15 +169,12 @@ def render_projects_view():
 
             st.session_state["landxml_bytes"] = xml_bytes
             st.session_state["landxml_key"] = key
-
-            # reset telg (uus mudel)
             st.session_state["axis_xy"] = []
             st.session_state["axis_finished"] = False
 
             st.success("LandXML salvestatud ja laaditud sessiooni.")
             st.rerun()
 
-        # Kui DB-s on landxml_key aga sessioonis pole bytes, lase kasutajal “Lae R2-st”
         if p.get("landxml_key") and st.session_state["landxml_bytes"] is None:
             if st.button("Lae eelmine LandXML R2-st (projektist)", use_container_width=True):
                 xml_bytes = download_bytes(s3, p["landxml_key"])
@@ -203,9 +185,7 @@ def render_projects_view():
 
         st.markdown("</div>", unsafe_allow_html=True)
 
-        # ============================================================
-        # 2) Telje joonistamine (Plotly click)
-        # ============================================================
+        # ---------------- Axis drawing + PK ----------------
         st.markdown('<div class="block">', unsafe_allow_html=True)
         st.subheader("🧭 Telje joonistamine (polyline) + PK tabel")
 
@@ -214,10 +194,9 @@ def render_projects_view():
             st.info("Lae LandXML üles, et saaks telge joonistada.")
             st.markdown("</div>", unsafe_allow_html=True)
         else:
-            # loe TIN punktid (ainult pealtvaateks)
             try:
-                pts_dict, faces = read_landxml_tin_from_bytes(xml_bytes)
-                xyz = np.array(list(pts_dict.values()), dtype=float)  # (N,3)
+                pts_dict, _faces = read_landxml_tin_from_bytes(xml_bytes)
+                xyz = np.array(list(pts_dict.values()), dtype=float)
                 xyz_show = _downsample_points(xyz, max_pts=60000)
             except Exception as e:
                 st.error(f"LandXML lugemine ebaõnnestus: {e}")
@@ -253,7 +232,7 @@ def render_projects_view():
             axis_xy = st.session_state["axis_xy"]
             finished = st.session_state["axis_finished"]
 
-            fig = _make_tin_figure(xyz_show, axis_xy, finished)
+            fig = _make_tin_figure(xyz_show, axis_xy)
 
             st.caption("👉 Klikk graafikul lisab telje punkti. Zoom/pan töötab Plotly toolbarist.")
             click_data = plotly_events(
@@ -266,7 +245,6 @@ def render_projects_view():
             )
 
             if click_data and not finished:
-                # click_data[0] sisaldab x/y
                 x = float(click_data[0]["x"])
                 y = float(click_data[0]["y"])
                 st.session_state["axis_xy"] = axis_xy + [(x, y)]
@@ -276,9 +254,6 @@ def render_projects_view():
                 L = polyline_length(axis_xy)
                 st.write(f"**Telje pikkus:** {L:.2f} m  |  Punkte: {len(axis_xy)}")
 
-            # ========================================================
-            # 3) Arvuta PK tabel + maht
-            # ========================================================
             st.markdown("### Arvutusparameetrid")
 
             c1, c2, c3 = st.columns(3)
@@ -317,13 +292,10 @@ def render_projects_view():
                     st.success(f"✅ Kokku maht: {res['total_volume_m3']:.3f} m³")
                     st.write(f"Telje pikkus: **{res['axis_length_m']:.2f} m** | PK-sid: **{res['count']}**")
 
-                    # planeeritud keskmine ristlõike pindala
-                    # (kui length>0) area_avg = V / L
                     planned_area = None
                     if res["axis_length_m"] and res["axis_length_m"] > 0 and res["total_volume_m3"] is not None:
                         planned_area = float(res["total_volume_m3"] / res["axis_length_m"])
 
-                    # salvesta projekti: landxml_key + planned values
                     key = st.session_state["landxml_key"] or p.get("landxml_key") or ""
                     set_project_landxml(
                         p["id"],
@@ -335,7 +307,6 @@ def render_projects_view():
 
                     st.dataframe(df, use_container_width=True)
 
-                    # CSV download
                     csv = df.to_csv(index=False, sep=";").encode("utf-8")
                     st.download_button(
                         "⬇️ Lae alla CSV",
@@ -347,7 +318,6 @@ def render_projects_view():
 
                     st.info("Tulemused salvestati projekti planned_* väljade alla (DB).")
 
-            # Näita projekti salvestatud planned tulemusi
             p2 = get_project(pid)
             if p2 and p2.get("planned_volume_m3") is not None:
                 st.markdown("### Projekti salvestatud planeeritud väärtused")
@@ -357,59 +327,7 @@ def render_projects_view():
 
             st.markdown("</div>", unsafe_allow_html=True)
 
-        # ============================================================
-        # Sinu olemasolev “Maht sinu parameetritest” plokk (jätan alles)
-        # ============================================================
-        st.markdown('<div class="block">', unsafe_allow_html=True)
-        st.subheader("🧮 Maht sinu parameetritest")
-
-        st.caption("Sisesta pikkus, põhi, nõlv ja sügavuse vahemik. Arvutame mahu (min/max/keskmine).")
-
-        c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
-        with c1:
-            L = st.number_input("Pikkus L (m)", min_value=0.0, value=50.0, step=1.0, key="vol_L")
-        with c2:
-            b = st.number_input("Põhja laius b (m)", min_value=0.0, value=0.4, step=0.1, key="vol_b")
-        with c3:
-            slope_n = st.number_input("Nõlv 1:n (n)", min_value=0.1, value=2.0, step=0.1, key="vol_n")
-        with c4:
-            d_min = st.number_input("Sügavus min (m)", min_value=0.0, value=1.5, step=0.1, key="vol_dmin")
-
-        d_max = st.number_input("Sügavus max (m)", min_value=0.0, value=2.5, step=0.1, key="vol_dmax")
-
-        if d_max < d_min:
-            st.error("Sügavus max peab olema >= sügavus min.")
-        else:
-            A_min = _area_trapezoid(d_min, b, slope_n)
-            A_max = _area_trapezoid(d_max, b, slope_n)
-            A_avg = (A_min + A_max) / 2.0
-
-            V_min = A_min * L
-            V_max = A_max * L
-            V_avg = A_avg * L
-
-            st.write(f"**Ristlõige min:** {A_min:.2f} m²")
-            st.write(f"**Ristlõige max:** {A_max:.2f} m²")
-            st.write(f"**Ristlõige keskmine:** {A_avg:.2f} m²")
-
-            st.write(f"**Maht min:** {V_min:.1f} m³")
-            st.write(f"**Maht max:** {V_max:.1f} m³")
-            st.write(f"**Maht keskmine:** {V_avg:.1f} m³")
-
-            T_min = b + 2.0 * slope_n * d_min
-            T_max = b + 2.0 * slope_n * d_max
-            st.caption(f"Sinu parameetritest pealmine laius: {T_min:.2f} – {T_max:.2f} m")
-
-            if p.get("top_width_m") is not None:
-                tw = float(p["top_width_m"])
-                if not (T_min <= tw <= T_max):
-                    st.warning("TIN pealmine laius ei jää sinu parameetrite vahemikku. Kontrolli b/n/d või TIN servi.")
-
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        # ============================================================
-        # Failid (R2) – sinu olemasolev osa
-        # ============================================================
+        # ---------------- R2 file upload ----------------
         st.markdown('<div class="block">', unsafe_allow_html=True)
         st.subheader("📤 Failid (Cloudflare R2)")
 
@@ -423,6 +341,7 @@ def render_projects_view():
 
         st.markdown("</div>", unsafe_allow_html=True)
 
+        # ---------------- File list ----------------
         st.subheader("📄 Projekti failid")
         prefix = project_prefix(p["name"])
         files = list_files(s3, prefix)
