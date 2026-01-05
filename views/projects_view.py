@@ -77,14 +77,28 @@ def _make_tin_figure(xyz_show: np.ndarray, axis_xy_abs, origin_abs):
     pad_y = dy * 0.05
 
     # ---- IMPORTANT: tolist() ----
-    fig.add_trace(go.Scatter(
-        x=x.tolist(),
-        y=y.tolist(),
-        mode="markers",
-        marker=dict(size=6, opacity=0.9),
-        name="TIN punktid",
-        hoverinfo="skip",
-    ))
+    # TIN punktid (päris nähtavad)
+fig.add_trace(go.Scatter(
+    x=x.tolist(),
+    y=y.tolist(),
+    mode="markers",
+    marker=dict(size=6, opacity=0.9),
+    name="TIN punktid",
+    hoverinfo="skip",
+))
+
+# "Click layer" – läbipaistev markerikiht suuremate markeritega,
+# et click registreeruks ka siis, kui sa ei taba täpselt punkti.
+fig.add_trace(go.Scatter(
+    x=x.tolist(),
+    y=y.tolist(),
+    mode="markers",
+    marker=dict(size=18, opacity=0.0),  # täiesti nähtamatu
+    name="click_layer",
+    hoverinfo="skip",
+    showlegend=False,
+))
+
 
     # axis abs -> local, also tolist()
     if axis_xy_abs:
