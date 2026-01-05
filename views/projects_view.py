@@ -38,7 +38,6 @@ def _downsample_points(xyz: np.ndarray, max_pts: int = 50000) -> np.ndarray:
 def _make_tin_figure(xyz_show: np.ndarray, axis_xy):
     fig = go.Figure()
 
-    # turvalisus: kui xyz_show tühi, näita midagi
     if xyz_show is None or xyz_show.size == 0:
         fig.update_layout(
             height=620,
@@ -47,26 +46,36 @@ def _make_tin_figure(xyz_show: np.ndarray, axis_xy):
         )
         return fig
 
-    x = xyz_show[:, 0]
-    y = xyz_show[:, 1]
+    # force float + filter NaN/Inf
+    x = np.asarray(xyz_show[:, 0], dtype=float)
+    y = np.asarray(xyz_show[:, 1], dtype=float)
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask]
+    y = y[mask]
 
-    # Range (et punktid oleks kohe näha)
+    if x.size < 2:
+        fig.update_layout(
+            height=620,
+            title="TIN punktid on vigased (NaN/Inf) või liiga vähe punkte",
+            margin=dict(l=10, r=10, t=40, b=10),
+        )
+        return fig
+
     xmin, xmax = float(np.min(x)), float(np.max(x))
     ymin, ymax = float(np.min(y)), float(np.max(y))
-
-    # väike padding
     dx = (xmax - xmin) if (xmax > xmin) else 1.0
     dy = (ymax - ymin) if (ymax > ymin) else 1.0
     pad_x = dx * 0.05
     pad_y = dy * 0.05
 
-    fig.add_trace(go.Scattergl(
+    # Use Scatter (not Scattergl) => works more reliably in Render/iframes
+    fig.add_trace(go.Scatter(
         x=x,
         y=y,
         mode="markers",
-        marker=dict(size=3, opacity=0.6),
+        marker=dict(size=4, opacity=0.7),
         name="TIN punktid",
-        hoverinfo="skip"
+        hoverinfo="skip",
     ))
 
     if axis_xy:
@@ -97,12 +106,10 @@ def _make_tin_figure(xyz_show: np.ndarray, axis_xy):
         dragmode="pan",
         uirevision="keep",
     )
-
-    fig.update_xaxes(title="X", range=[xmin - pad_x, xmax + pad_x])
-    fig.update_yaxes(title="Y", range=[ymin - pad_y, ymax + pad_y], scaleanchor="x", scaleratio=1)
+    fig.update_xaxes(title="E (Easting)", range=[xmin - pad_x, xmax + pad_x])
+    fig.update_yaxes(title="N (Northing)", range=[ymin - pad_y, ymax + pad_y], scaleanchor="x", scaleratio=1)
 
     return fig
-
 
 
 def render_projects_view():
@@ -213,7 +220,17 @@ def render_projects_view():
             try:
                 pts_dict, _faces = read_landxml_tin_from_bytes(xml_bytes)
                 xyz = np.array(list(pts_dict.values()), dtype=float)
+
+                # downsample for display
                 xyz_show = _downsample_points(xyz, max_pts=60000)
+
+                # debug (võid hiljem ära võtta)
+                st.caption(f"Punkte kokku: {xyz.shape[0]} | Näitan: {xyz_show.shape[0]}")
+                st.caption(
+                    f"X min/max: {np.nanmin(xyz_show[:,0]):.3f} / {np.nanmax(xyz_show[:,0]):.3f} | "
+                    f"Y min/max: {np.nanmin(xyz_show[:,1]):.3f} / {np.nanmax(xyz_show[:,1]):.3f}"
+                )
+
             except Exception as e:
                 st.error(f"LandXML lugemine ebaõnnestus: {e}")
                 st.markdown("</div>", unsafe_allow_html=True)
@@ -252,13 +269,14 @@ def render_projects_view():
 
             st.caption("👉 Klikk graafikul lisab telje punkti. Zoom/pan töötab Plotly toolbarist.")
             click_data = plotly_events(
-    fig,
-    click_event=True,
-    select_event=False,
-    hover_event=False,
-    override_height=620,
-    key="tin_plot_events",
+                fig,
+                click_event=True,
+                select_event=False,
+                hover_event=False,
+                override_height=620,
+                key="tin_plot_events",
             )
+
             if click_data and not finished:
                 x = float(click_data[0]["x"])
                 y = float(click_data[0]["y"])
@@ -301,14 +319,13 @@ def render_projects_view():
                         bottom_w=float(bottom_w),
                     )
 
-                    rows = res["rows"]
-                    df = pd.DataFrame(rows)
+                    df = pd.DataFrame(res["rows"])
 
                     st.success(f"✅ Kokku maht: {res['total_volume_m3']:.3f} m³")
                     st.write(f"Telje pikkus: **{res['axis_length_m']:.2f} m** | PK-sid: **{res['count']}**")
 
                     planned_area = None
-                    if res["axis_length_m"] and res["axis_length_m"] > 0 and res["total_volume_m3"] is not None:
+                    if res["axis_length_m"] > 0 and res["total_volume_m3"] is not None:
                         planned_area = float(res["total_volume_m3"] / res["axis_length_m"])
 
                     key = st.session_state["landxml_key"] or p.get("landxml_key") or ""
@@ -373,7 +390,7 @@ def render_projects_view():
             with bcol:
                 data = download_bytes(s3, f["key"])
                 st.download_button(
-                    "⬇️ Laadi alla",
+                    "⬇️ Lae alla",
                     data=data,
                     file_name=f["name"],
                     key=f"dl_{f['key']}",
