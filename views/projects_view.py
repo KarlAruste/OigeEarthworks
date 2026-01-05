@@ -258,15 +258,7 @@ def render_projects_view():
     hover_event=False,
     override_height=620,
     key="tin_plot_events",
-    config={
-        "scrollZoom": True,        # hiire rullik zoom
-        "displaylogo": False,
-        "modeBarButtonsToRemove": ["lasso2d", "select2d"],
-                              },
-                  )
-
-
-
+            )
             if click_data and not finished:
                 x = float(click_data[0]["x"])
                 y = float(click_data[0]["y"])
