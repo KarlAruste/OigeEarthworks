@@ -26,9 +26,6 @@ from landxml import (
     polyline_length,
 )
 
-from streamlit_plotly_events import plotly_events
-
-
 
 # -------------------------
 # Helpers
@@ -49,33 +46,60 @@ def _nearest_point_abs_from_click_local(
     origin_abs: tuple[float, float],
 ) -> tuple[float, float]:
     """
-    click_local_xy is in local coords (as returned by plotly_events on our local plot).
-    We "snap" to nearest displayed TIN point (xyz_show_abs).
-    Returns ABS (E,N).
+    click_local_xy: (x_local, y_local) from the plot (LOCAL coords)
+    xyz_show_abs: downsampled ABS points used for plotting
+    origin_abs: (E0, N0) used for local plot origin
+    returns: snapped ABS (E,N)
     """
-    if xyz_show_abs is None or xyz_show_abs.size == 0:
-        # fallback: convert local->abs directly
-        x0, y0 = origin_abs
-        return (click_local_xy[0] + x0, click_local_xy[1] + y0)
-
     x0, y0 = origin_abs
     cx_abs = click_local_xy[0] + x0
     cy_abs = click_local_xy[1] + y0
+
+    if xyz_show_abs is None or xyz_show_abs.size == 0:
+        return (cx_abs, cy_abs)
 
     X = xyz_show_abs[:, 0].astype(float)
     Y = xyz_show_abs[:, 1].astype(float)
     m = np.isfinite(X) & np.isfinite(Y)
     X = X[m]
     Y = Y[m]
-
     if X.size == 0:
         return (cx_abs, cy_abs)
 
-    # nearest by squared distance
     dx = X - cx_abs
     dy = Y - cy_abs
     j = int(np.argmin(dx * dx + dy * dy))
     return (float(X[j]), float(Y[j]))
+
+
+def _extract_selected_point(sel):
+    """
+    Streamlit st.plotly_chart(on_select="rerun") returns a selection payload.
+    This function tries to extract the first selected point robustly across versions.
+    Returns dict with at least keys x,y and maybe point_index/curve_number.
+    """
+    if sel is None:
+        return None
+
+    # Newer Streamlit returns dict-like object
+    if isinstance(sel, dict):
+        selection = sel.get("selection") or {}
+        pts = selection.get("points") or []
+        if pts:
+            return pts[0]
+        return None
+
+    # Some versions expose attributes
+    try:
+        selection = getattr(sel, "selection", None)
+        if selection and isinstance(selection, dict):
+            pts = selection.get("points") or []
+            if pts:
+                return pts[0]
+    except Exception:
+        pass
+
+    return None
 
 
 def _make_tin_figure(
@@ -84,8 +108,9 @@ def _make_tin_figure(
     origin_abs: tuple[float, float],
 ):
     """
-    Plot points in LOCAL coords for stable web rendering.
-    All x/y are Python lists (not numpy arrays) for streamlit-plotly-events compatibility.
+    Plot in LOCAL coords for stable web rendering.
+    Use clickmode=event+select so Streamlit can capture selected point.
+    Add an invisible click-layer (bigger markers) so it's easy to select a point.
     """
     fig = go.Figure()
 
@@ -102,7 +127,6 @@ def _make_tin_figure(
     m = np.isfinite(x_abs) & np.isfinite(y_abs)
     x_abs = x_abs[m]
     y_abs = y_abs[m]
-
     if x_abs.size < 2:
         fig.update_layout(
             height=620,
@@ -112,8 +136,8 @@ def _make_tin_figure(
         return fig
 
     x0, y0 = origin_abs
-    x = (x_abs - x0)
-    y = (y_abs - y0)
+    x = x_abs - x0
+    y = y_abs - y0
 
     xmin, xmax = float(np.min(x)), float(np.max(x))
     ymin, ymax = float(np.min(y)), float(np.max(y))
@@ -131,6 +155,19 @@ def _make_tin_figure(
             marker=dict(size=6, opacity=0.9),
             name="TIN punktid",
             hoverinfo="skip",
+        )
+    )
+
+    # Invisible click-layer (same points, bigger marker, opacity 0)
+    fig.add_trace(
+        go.Scatter(
+            x=x.tolist(),
+            y=y.tolist(),
+            mode="markers",
+            marker=dict(size=22, opacity=0.0),
+            name="click_layer",
+            hoverinfo="skip",
+            showlegend=False,
         )
     )
 
@@ -167,6 +204,7 @@ def _make_tin_figure(
         dragmode="pan",
         uirevision="keep",
         template="plotly_white",
+        clickmode="event+select",
     )
 
     fig.add_annotation(
@@ -195,13 +233,13 @@ def render_projects_view():
 
     # Session defaults
     st.session_state.setdefault("active_project_id", None)
-    st.session_state.setdefault("axis_xy", [])          # ABS coords
+    st.session_state.setdefault("axis_xy", [])          # ABS coords list[(E,N)]
     st.session_state.setdefault("axis_finished", False)
     st.session_state.setdefault("landxml_bytes", None)
     st.session_state.setdefault("landxml_key", None)
-    st.session_state.setdefault("plot_origin", None)    # ABS origin for local plot
-    st.session_state.setdefault("xyz_show_cache", None) # ABS points used for plotting
-    st.session_state.setdefault("click_count", 0)
+    st.session_state.setdefault("plot_origin", None)    # ABS (E0,N0) for local plot
+    st.session_state.setdefault("xyz_show_cache", None) # ABS downsample points
+    st.session_state.setdefault("last_click_sig", None) # avoid duplicate add on rerun
 
     # ---------------- Create project ----------------
     st.markdown('<div class="block">', unsafe_allow_html=True)
@@ -245,7 +283,7 @@ def render_projects_view():
                 st.session_state["landxml_key"] = None
                 st.session_state["plot_origin"] = None
                 st.session_state["xyz_show_cache"] = None
-                st.session_state["click_count"] = 0
+                st.session_state["last_click_sig"] = None
                 st.rerun()
 
     with right:
@@ -280,7 +318,7 @@ def render_projects_view():
             st.session_state["axis_finished"] = False
             st.session_state["plot_origin"] = None
             st.session_state["xyz_show_cache"] = None
-            st.session_state["click_count"] = 0
+            st.session_state["last_click_sig"] = None
 
             st.success("LandXML salvestatud ja laaditud sessiooni.")
             st.rerun()
@@ -296,7 +334,7 @@ def render_projects_view():
             st.info("Lae LandXML üles, et saaks telge joonistada.")
             st.markdown("</div>", unsafe_allow_html=True)
         else:
-            # Read & cache points
+            # Read/caches
             try:
                 pts_dict, _faces = read_landxml_tin_from_bytes(xml_bytes)
                 xyz = np.array(list(pts_dict.values()), dtype=float)
@@ -313,31 +351,31 @@ def render_projects_view():
                     f"ABS X min/max: {np.nanmin(xyz_show[:,0]):.3f} / {np.nanmax(xyz_show[:,0]):.3f} | "
                     f"ABS Y min/max: {np.nanmin(xyz_show[:,1]):.3f} / {np.nanmax(xyz_show[:,1]):.3f}"
                 )
-
             except Exception as e:
                 st.error(f"LandXML lugemine ebaõnnestus: {e}")
                 st.markdown("</div>", unsafe_allow_html=True)
                 return
 
-            # Control buttons
+            # Buttons
             cA, cB, cC, cD = st.columns([1, 1, 1, 2])
             with cA:
                 if st.button("Alusta / joonista telg", use_container_width=True):
                     st.session_state["axis_xy"] = []
                     st.session_state["axis_finished"] = False
-                    st.session_state["click_count"] = 0
+                    st.session_state["last_click_sig"] = None
                     st.rerun()
             with cB:
                 if st.button("Undo (eemalda viimane)", use_container_width=True):
                     if st.session_state["axis_xy"]:
                         st.session_state["axis_xy"] = st.session_state["axis_xy"][:-1]
                         st.session_state["axis_finished"] = False
+                        st.session_state["last_click_sig"] = None
                         st.rerun()
             with cC:
                 if st.button("Tühjenda telg", use_container_width=True):
                     st.session_state["axis_xy"] = []
                     st.session_state["axis_finished"] = False
-                    st.session_state["click_count"] = 0
+                    st.session_state["last_click_sig"] = None
                     st.rerun()
             with cD:
                 if st.button("Lõpeta telg", use_container_width=True):
@@ -353,55 +391,58 @@ def render_projects_view():
             origin_abs = st.session_state["plot_origin"]
             xyz_show_abs = st.session_state["xyz_show_cache"]
 
-            # Plot
             fig = _make_tin_figure(xyz_show_abs, axis_xy_abs, origin_abs)
 
-            st.caption("👉 Klikk kus iganes tee peal – lisab teljele LÄHIMA TIN punkti (snap).")
-            st.caption(f"Klikke saadud: {st.session_state['click_count']}")
+            st.caption("👉 Kliki punktile/joonele – lisab teljele LÄHIMA TIN punkti (snap).")
+            st.caption("Zoom: hiirerull (scroll) töötab. Pan: lohista hiirega.")
 
-            click_data = plotly_events(
+            # STREAMLIT NATIVE SELECTION (works on Render)
+            sel = st.plotly_chart(
                 fig,
-                click_event=True,
-                select_event=False,
-                hover_event=False,
-                override_height=620,
-                key="tin_plot_events",
+                use_container_width=True,
+                config={"scrollZoom": True, "displaylogo": False},
+                on_select="rerun",
+                selection_mode="points",
+                key="tin_plot",
             )
 
-            if (click_data and len(click_data) > 0) and not finished:
-                # local click coords
-                x_local = float(click_data[0].get("x"))
-                y_local = float(click_data[0].get("y"))
+            picked = _extract_selected_point(sel)
 
-                # snap nearest ABS point
-                x_abs, y_abs = _nearest_point_abs_from_click_local(
-                    (x_local, y_local),
-                    xyz_show_abs,
-                    origin_abs,
-                )
+            if (not finished) and picked:
+                x_local = float(picked.get("x"))
+                y_local = float(picked.get("y"))
 
-                st.session_state["axis_xy"] = axis_xy_abs + [(x_abs, y_abs)]
-                st.session_state["click_count"] = int(st.session_state["click_count"]) + 1
-                st.rerun()
+                # signature to avoid double add on rerun
+                curve = int(picked.get("curve_number", picked.get("curveNumber", 0)))
+                pidx = int(picked.get("point_index", picked.get("pointIndex", -1)))
+                sig = (curve, pidx)
+
+                if sig != st.session_state.get("last_click_sig"):
+                    st.session_state["last_click_sig"] = sig
+
+                    x_abs, y_abs = _nearest_point_abs_from_click_local(
+                        (x_local, y_local),
+                        xyz_show_abs,
+                        origin_abs,
+                    )
+                    st.session_state["axis_xy"] = axis_xy_abs + [(x_abs, y_abs)]
+                    st.rerun()
 
             if axis_xy_abs:
                 L = polyline_length(axis_xy_abs)
                 st.write(f"**Telje pikkus:** {L:.2f} m  |  Punkte: {len(axis_xy_abs)}")
 
-            # Params
+            # Parameters
             st.markdown("### Arvutusparameetrid")
             c1, c2, c3 = st.columns(3)
-
             with c1:
                 pk_step = st.number_input("PK samm (m)", min_value=0.1, value=1.0, step=0.1)
                 cross_len = st.number_input("Ristlõike kogupikkus (m)", min_value=2.0, value=25.0, step=1.0)
                 sample_step = st.number_input("Proovipunkti samm (m)", min_value=0.02, value=0.1, step=0.01)
-
             with c2:
                 tol = st.number_input("Tasase tolerants (m)", min_value=0.001, value=0.05, step=0.005)
                 min_run = st.number_input("Min tasane lõik (m)", min_value=0.05, value=0.2, step=0.05)
                 min_depth = st.number_input("Min kõrgus põhjast (m)", min_value=0.0, value=0.3, step=0.05)
-
             with c3:
                 slope = st.text_input("Nõlva kalle (nt 1:2)", value="1:2")
                 bottom_w = st.number_input("Põhja laius b (m)", min_value=0.0, value=0.40, step=0.05)
