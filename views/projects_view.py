@@ -38,11 +38,33 @@ def _downsample_points(xyz: np.ndarray, max_pts: int = 50000) -> np.ndarray:
 def _make_tin_figure(xyz_show: np.ndarray, axis_xy):
     fig = go.Figure()
 
+    # turvalisus: kui xyz_show tühi, näita midagi
+    if xyz_show is None or xyz_show.size == 0:
+        fig.update_layout(
+            height=620,
+            title="TIN punkte ei leitud (kontrolli LandXML)",
+            margin=dict(l=10, r=10, t=40, b=10),
+        )
+        return fig
+
+    x = xyz_show[:, 0]
+    y = xyz_show[:, 1]
+
+    # Range (et punktid oleks kohe näha)
+    xmin, xmax = float(np.min(x)), float(np.max(x))
+    ymin, ymax = float(np.min(y)), float(np.max(y))
+
+    # väike padding
+    dx = (xmax - xmin) if (xmax > xmin) else 1.0
+    dy = (ymax - ymin) if (ymax > ymin) else 1.0
+    pad_x = dx * 0.05
+    pad_y = dy * 0.05
+
     fig.add_trace(go.Scattergl(
-        x=xyz_show[:, 0],
-        y=xyz_show[:, 1],
+        x=x,
+        y=y,
         mode="markers",
-        marker=dict(size=3, opacity=0.55),
+        marker=dict(size=3, opacity=0.6),
         name="TIN punktid",
         hoverinfo="skip"
     ))
@@ -73,12 +95,14 @@ def _make_tin_figure(xyz_show: np.ndarray, axis_xy):
         title="Pealtvaade (kliki punkte telje joonistamiseks)",
         legend=dict(orientation="h"),
         dragmode="pan",
-        uirevision="keep"
+        uirevision="keep",
     )
-    fig.update_yaxes(scaleanchor="x", scaleratio=1)
-    fig.update_xaxes(title="X")
-    fig.update_yaxes(title="Y")
+
+    fig.update_xaxes(title="X", range=[xmin - pad_x, xmax + pad_x])
+    fig.update_yaxes(title="Y", range=[ymin - pad_y, ymax + pad_y], scaleanchor="x", scaleratio=1)
+
     return fig
+
 
 
 def render_projects_view():
@@ -236,13 +260,20 @@ def render_projects_view():
 
             st.caption("👉 Klikk graafikul lisab telje punkti. Zoom/pan töötab Plotly toolbarist.")
             click_data = plotly_events(
-                fig,
-                click_event=True,
-                select_event=False,
-                hover_event=False,
-                override_height=620,
-                key="tin_plot_events",
-            )
+    fig,
+    click_event=True,
+    select_event=False,
+    hover_event=False,
+    override_height=620,
+    key="tin_plot_events",
+    config={
+        "scrollZoom": True,        # hiire rullik zoom
+        "displaylogo": False,
+        "modeBarButtonsToRemove": ["lasso2d", "select2d"],
+                              },
+                  )
+
+
 
             if click_data and not finished:
                 x = float(click_data[0]["x"])
