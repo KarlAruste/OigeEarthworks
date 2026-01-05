@@ -35,7 +35,12 @@ def _downsample_points(xyz: np.ndarray, max_pts: int = 50000) -> np.ndarray:
     return xyz[idx]
 
 
-def _make_tin_figure(xyz_show: np.ndarray, axis_xy):
+def _make_tin_figure(xyz_show: np.ndarray, axis_xy_abs, origin_abs):
+    """
+    Draws points in LOCAL coords for stable Plotly rendering in web.
+    axis_xy_abs is stored in ABS coords (E,N).
+    origin_abs = (E0, N0)
+    """
     fig = go.Figure()
 
     if xyz_show is None or xyz_show.size == 0:
@@ -46,20 +51,25 @@ def _make_tin_figure(xyz_show: np.ndarray, axis_xy):
         )
         return fig
 
-    # force float + filter NaN/Inf
-    x = np.asarray(xyz_show[:, 0], dtype=float)
-    y = np.asarray(xyz_show[:, 1], dtype=float)
-    mask = np.isfinite(x) & np.isfinite(y)
-    x = x[mask]
-    y = y[mask]
+    # --- ABS coords from data ---
+    x_abs = np.asarray(xyz_show[:, 0], dtype=float)
+    y_abs = np.asarray(xyz_show[:, 1], dtype=float)
+    mask = np.isfinite(x_abs) & np.isfinite(y_abs)
+    x_abs = x_abs[mask]
+    y_abs = y_abs[mask]
 
-    if x.size < 2:
+    if x_abs.size < 2:
         fig.update_layout(
             height=620,
             title="TIN punktid on vigased (NaN/Inf) või liiga vähe punkte",
             margin=dict(l=10, r=10, t=40, b=10),
         )
         return fig
+
+    # --- LOCAL coords for display ---
+    x0, y0 = origin_abs
+    x = x_abs - x0
+    y = y_abs - y0
 
     xmin, xmax = float(np.min(x)), float(np.max(x))
     ymin, ymax = float(np.min(y)), float(np.max(y))
@@ -68,19 +78,20 @@ def _make_tin_figure(xyz_show: np.ndarray, axis_xy):
     pad_x = dx * 0.05
     pad_y = dy * 0.05
 
-    # Use Scatter (not Scattergl) => works more reliably in Render/iframes
+    # Use Scatter (not Scattergl) – most reliable in Render/iframe
     fig.add_trace(go.Scatter(
         x=x,
         y=y,
         mode="markers",
-        marker=dict(size=4, opacity=0.7),
+        marker=dict(size=4, opacity=0.75),
         name="TIN punktid",
         hoverinfo="skip",
     ))
 
-    if axis_xy:
-        xs = [p[0] for p in axis_xy]
-        ys = [p[1] for p in axis_xy]
+    # Axis (stored ABS) -> display LOCAL
+    if axis_xy_abs:
+        xs = [p[0] - x0 for p in axis_xy_abs]
+        ys = [p[1] - y0 for p in axis_xy_abs]
         fig.add_trace(go.Scatter(
             x=xs, y=ys,
             mode="lines+markers",
@@ -89,7 +100,7 @@ def _make_tin_figure(xyz_show: np.ndarray, axis_xy):
             name="Telg"
         ))
 
-        L = polyline_length(axis_xy)
+        L = polyline_length(axis_xy_abs)
         fig.add_annotation(
             x=xs[-1], y=ys[-1],
             text=f"{L:.2f} m",
@@ -101,13 +112,22 @@ def _make_tin_figure(xyz_show: np.ndarray, axis_xy):
     fig.update_layout(
         height=620,
         margin=dict(l=10, r=10, t=40, b=10),
-        title="Pealtvaade (kliki punkte telje joonistamiseks)",
+        title="Pealtvaade (lokaalne; kliki punkte telje joonistamiseks)",
         legend=dict(orientation="h"),
         dragmode="pan",
         uirevision="keep",
     )
-    fig.update_xaxes(title="E (Easting)", range=[xmin - pad_x, xmax + pad_x])
-    fig.update_yaxes(title="N (Northing)", range=[ymin - pad_y, ymax + pad_y], scaleanchor="x", scaleratio=1)
+
+    fig.add_annotation(
+        x=xmin - pad_x, y=ymin - pad_y,
+        text=f"Lokaalne (0,0) = E {x0:.3f}, N {y0:.3f}",
+        showarrow=False,
+        xanchor="left",
+        yanchor="bottom"
+    )
+
+    fig.update_xaxes(title="E (local, m)", range=[xmin - pad_x, xmax + pad_x])
+    fig.update_yaxes(title="N (local, m)", range=[ymin - pad_y, ymax + pad_y], scaleanchor="x", scaleratio=1)
 
     return fig
 
@@ -121,6 +141,7 @@ def render_projects_view():
     if "active_project_id" not in st.session_state:
         st.session_state["active_project_id"] = None
 
+    # Axis stored in ABS coords (E,N)
     if "axis_xy" not in st.session_state:
         st.session_state["axis_xy"] = []
     if "axis_finished" not in st.session_state:
@@ -130,6 +151,10 @@ def render_projects_view():
         st.session_state["landxml_bytes"] = None
     if "landxml_key" not in st.session_state:
         st.session_state["landxml_key"] = None
+
+    # origin used for plotting (ABS coords)
+    if "plot_origin" not in st.session_state:
+        st.session_state["plot_origin"] = None  # (E0,N0)
 
     # ---------------- Create project ----------------
     st.markdown('<div class="block">', unsafe_allow_html=True)
@@ -171,6 +196,7 @@ def render_projects_view():
                 st.session_state["axis_finished"] = False
                 st.session_state["landxml_bytes"] = None
                 st.session_state["landxml_key"] = None
+                st.session_state["plot_origin"] = None
                 st.rerun()
 
     with right:
@@ -202,6 +228,7 @@ def render_projects_view():
             st.session_state["landxml_key"] = key
             st.session_state["axis_xy"] = []
             st.session_state["axis_finished"] = False
+            st.session_state["plot_origin"] = None
 
             st.success("LandXML salvestatud ja laaditud sessiooni.")
             st.rerun()
@@ -224,11 +251,17 @@ def render_projects_view():
                 # downsample for display
                 xyz_show = _downsample_points(xyz, max_pts=60000)
 
-                # debug (võid hiljem ära võtta)
+                # set plot origin once (ABS)
+                if st.session_state["plot_origin"] is None:
+                    x0 = float(np.mean(xyz_show[:, 0]))
+                    y0 = float(np.mean(xyz_show[:, 1]))
+                    st.session_state["plot_origin"] = (x0, y0)
+
+                # debug (võid hiljem eemaldada)
                 st.caption(f"Punkte kokku: {xyz.shape[0]} | Näitan: {xyz_show.shape[0]}")
                 st.caption(
-                    f"X min/max: {np.nanmin(xyz_show[:,0]):.3f} / {np.nanmax(xyz_show[:,0]):.3f} | "
-                    f"Y min/max: {np.nanmin(xyz_show[:,1]):.3f} / {np.nanmax(xyz_show[:,1]):.3f}"
+                    f"ABS X min/max: {np.nanmin(xyz_show[:,0]):.3f} / {np.nanmax(xyz_show[:,0]):.3f} | "
+                    f"ABS Y min/max: {np.nanmin(xyz_show[:,1]):.3f} / {np.nanmax(xyz_show[:,1]):.3f}"
                 )
 
             except Exception as e:
@@ -262,10 +295,11 @@ def render_projects_view():
                         st.success("Telg lõpetatud.")
                         st.rerun()
 
-            axis_xy = st.session_state["axis_xy"]
+            axis_xy_abs = st.session_state["axis_xy"]
             finished = st.session_state["axis_finished"]
+            origin_abs = st.session_state["plot_origin"]
 
-            fig = _make_tin_figure(xyz_show, axis_xy)
+            fig = _make_tin_figure(xyz_show, axis_xy_abs, origin_abs)
 
             st.caption("👉 Klikk graafikul lisab telje punkti. Zoom/pan töötab Plotly toolbarist.")
             click_data = plotly_events(
@@ -277,15 +311,19 @@ def render_projects_view():
                 key="tin_plot_events",
             )
 
+            # click gives LOCAL coords (because plot is local) => convert back to ABS for saving
             if click_data and not finished:
-                x = float(click_data[0]["x"])
-                y = float(click_data[0]["y"])
-                st.session_state["axis_xy"] = axis_xy + [(x, y)]
+                x_local = float(click_data[0]["x"])
+                y_local = float(click_data[0]["y"])
+                x0, y0 = origin_abs
+                x_abs = x_local + x0
+                y_abs = y_local + y0
+                st.session_state["axis_xy"] = axis_xy_abs + [(x_abs, y_abs)]
                 st.rerun()
 
-            if axis_xy:
-                L = polyline_length(axis_xy)
-                st.write(f"**Telje pikkus:** {L:.2f} m  |  Punkte: {len(axis_xy)}")
+            if axis_xy_abs:
+                L = polyline_length(axis_xy_abs)
+                st.write(f"**Telje pikkus:** {L:.2f} m  |  Punkte: {len(axis_xy_abs)}")
 
             st.markdown("### Arvutusparameetrid")
 
@@ -303,12 +341,12 @@ def render_projects_view():
                 bottom_w = st.number_input("Põhja laius b (m)", min_value=0.0, value=0.40, step=0.05)
 
             if st.button("Arvuta PK tabel (telje järgi)", use_container_width=True):
-                if len(axis_xy) < 2:
+                if len(axis_xy_abs) < 2:
                     st.warning("Joonista telg enne arvutamist.")
                 else:
                     res = compute_pk_table_from_landxml(
                         xml_bytes=xml_bytes,
-                        axis_xy=axis_xy,
+                        axis_xy=axis_xy_abs,   # ABS coords (E,N)
                         pk_step=float(pk_step),
                         cross_len=float(cross_len),
                         sample_step=float(sample_step),
