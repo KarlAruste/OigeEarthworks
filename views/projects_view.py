@@ -199,14 +199,6 @@ def render_projects_view():
             st.success("LandXML salvestatud ja laaditud sessiooni.")
             st.rerun()
 
-        if p.get("landxml_key") and st.session_state["landxml_bytes"] is None:
-            if st.button("Lae eelmine LandXML R2-st (projektist)", use_container_width=True):
-                xml_bytes = download_bytes(s3, p["landxml_key"])
-                st.session_state["landxml_bytes"] = xml_bytes
-                st.session_state["landxml_key"] = p["landxml_key"]
-                st.success("Laetud.")
-                st.rerun()
-
         st.markdown("</div>", unsafe_allow_html=True)
 
         # ---------------- Axis drawing + PK ----------------
