@@ -6,6 +6,6 @@ pandas
 matplotlib
 numpy
 plotly
-streamlit-plotly-events
+streamlit-plotly-events==0.0.6
 psycopg[binary]
-streamlit-plotly-events
+
