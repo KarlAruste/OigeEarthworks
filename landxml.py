@@ -13,6 +13,7 @@ import numpy as np
 # ============================================================
 def _strip(tag: str) -> str:
     return tag.split("}")[-1] if "}" in tag else tag
+    
 
 
 def read_landxml_tin_from_bytes(xml_bytes: bytes):
