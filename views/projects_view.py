@@ -37,9 +37,8 @@ def _downsample_points(xyz: np.ndarray, max_pts: int = 50000) -> np.ndarray:
 
 def _make_tin_figure(xyz_show: np.ndarray, axis_xy_abs, origin_abs):
     """
-    Draws points in LOCAL coords for stable Plotly rendering in web.
-    axis_xy_abs is stored in ABS coords (E,N).
-    origin_abs = (E0, N0)
+    Draw points in LOCAL coords for stable Plotly rendering in web/components.
+    IMPORTANT: Convert all arrays to Python lists (streamlit-plotly-events issue).
     """
     fig = go.Figure()
 
@@ -51,7 +50,6 @@ def _make_tin_figure(xyz_show: np.ndarray, axis_xy_abs, origin_abs):
         )
         return fig
 
-    # --- ABS coords from data ---
     x_abs = np.asarray(xyz_show[:, 0], dtype=float)
     y_abs = np.asarray(xyz_show[:, 1], dtype=float)
     mask = np.isfinite(x_abs) & np.isfinite(y_abs)
@@ -66,7 +64,7 @@ def _make_tin_figure(xyz_show: np.ndarray, axis_xy_abs, origin_abs):
         )
         return fig
 
-    # --- LOCAL coords for display ---
+    # local coords
     x0, y0 = origin_abs
     x = x_abs - x0
     y = y_abs - y0
@@ -78,26 +76,27 @@ def _make_tin_figure(xyz_show: np.ndarray, axis_xy_abs, origin_abs):
     pad_x = dx * 0.05
     pad_y = dy * 0.05
 
-    # Use Scatter (not Scattergl) – most reliable in Render/iframe
+    # ---- IMPORTANT: tolist() ----
     fig.add_trace(go.Scatter(
-        x=x,
-        y=y,
+        x=x.tolist(),
+        y=y.tolist(),
         mode="markers",
-        marker=dict(size=4, opacity=0.75),
+        marker=dict(size=6, opacity=0.9),
         name="TIN punktid",
         hoverinfo="skip",
     ))
 
-    # Axis (stored ABS) -> display LOCAL
+    # axis abs -> local, also tolist()
     if axis_xy_abs:
-        xs = [p[0] - x0 for p in axis_xy_abs]
-        ys = [p[1] - y0 for p in axis_xy_abs]
+        xs = [(p[0] - x0) for p in axis_xy_abs]
+        ys = [(p[1] - y0) for p in axis_xy_abs]
         fig.add_trace(go.Scatter(
-            x=xs, y=ys,
+            x=xs,
+            y=ys,
             mode="lines+markers",
             line=dict(width=4),
-            marker=dict(size=8),
-            name="Telg"
+            marker=dict(size=9),
+            name="Telg",
         ))
 
         L = polyline_length(axis_xy_abs)
@@ -116,6 +115,7 @@ def _make_tin_figure(xyz_show: np.ndarray, axis_xy_abs, origin_abs):
         legend=dict(orientation="h"),
         dragmode="pan",
         uirevision="keep",
+        template="plotly_white",
     )
 
     fig.add_annotation(
@@ -130,6 +130,7 @@ def _make_tin_figure(xyz_show: np.ndarray, axis_xy_abs, origin_abs):
     fig.update_yaxes(title="N (local, m)", range=[ymin - pad_y, ymax + pad_y], scaleanchor="x", scaleratio=1)
 
     return fig
+
 
 
 def render_projects_view():
