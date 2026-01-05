@@ -6,8 +6,10 @@ import pandas as pd
 import plotly.graph_objects as go
 
 from db import (
-    list_projects, create_project, get_project,
-    set_project_landxml
+    list_projects,
+    create_project,
+    get_project,
+    set_project_landxml,
 )
 from r2 import (
     get_s3,
@@ -18,7 +20,6 @@ from r2 import (
     list_files,
     delete_key,
 )
-
 from landxml import (
     read_landxml_tin_from_bytes,
     compute_pk_table_from_landxml,
@@ -28,17 +29,26 @@ from landxml import (
 from streamlit_plotly_events import plotly_events
 
 
-def _downsample_points(xyz: np.ndarray, max_pts: int = 50000) -> np.ndarray:
-    if xyz.shape[0] <= max_pts:
+# -------------------------
+# Helpers
+# -------------------------
+def _downsample_points(xyz: np.ndarray, max_pts: int = 60000) -> np.ndarray:
+    """Downsample for display speed."""
+    if xyz is None or xyz.size == 0:
         return xyz
-    idx = np.random.choice(xyz.shape[0], size=max_pts, replace=False)
+    n = xyz.shape[0]
+    if n <= max_pts:
+        return xyz
+    idx = np.random.choice(n, size=max_pts, replace=False)
     return xyz[idx]
 
 
-def _make_tin_figure(xyz_show: np.ndarray, axis_xy_abs, origin_abs):
+def _make_tin_figure(xyz_show: np.ndarray, axis_xy_abs: list[tuple[float, float]], origin_abs: tuple[float, float]):
     """
-    Draw points in LOCAL coords for stable Plotly rendering in web/components.
-    IMPORTANT: Convert all arrays to Python lists (streamlit-plotly-events issue).
+    IMPORTANT:
+    - Plot in LOCAL coords (small numbers) to avoid Plotly/iframe rendering issues.
+    - Convert arrays to Python lists (streamlit-plotly-events can choke on numpy arrays).
+    - Add an invisible "click layer" to make clicking easier.
     """
     fig = go.Figure()
 
@@ -50,11 +60,12 @@ def _make_tin_figure(xyz_show: np.ndarray, axis_xy_abs, origin_abs):
         )
         return fig
 
+    # ABS coords
     x_abs = np.asarray(xyz_show[:, 0], dtype=float)
     y_abs = np.asarray(xyz_show[:, 1], dtype=float)
-    mask = np.isfinite(x_abs) & np.isfinite(y_abs)
-    x_abs = x_abs[mask]
-    y_abs = y_abs[mask]
+    m = np.isfinite(x_abs) & np.isfinite(y_abs)
+    x_abs = x_abs[m]
+    y_abs = y_abs[m]
 
     if x_abs.size < 2:
         fig.update_layout(
@@ -64,7 +75,7 @@ def _make_tin_figure(xyz_show: np.ndarray, axis_xy_abs, origin_abs):
         )
         return fig
 
-    # local coords
+    # LOCAL coords
     x0, y0 = origin_abs
     x = x_abs - x0
     y = y_abs - y0
@@ -76,50 +87,55 @@ def _make_tin_figure(xyz_show: np.ndarray, axis_xy_abs, origin_abs):
     pad_x = dx * 0.05
     pad_y = dy * 0.05
 
-    # ---- IMPORTANT: tolist() ----
-    # TIN punktid (päris nähtavad)
-fig.add_trace(go.Scatter(
-    x=x.tolist(),
-    y=y.tolist(),
-    mode="markers",
-    marker=dict(size=6, opacity=0.9),
-    name="TIN punktid",
-    hoverinfo="skip",
-))
+    # Visible points
+    fig.add_trace(
+        go.Scatter(
+            x=x.tolist(),
+            y=y.tolist(),
+            mode="markers",
+            marker=dict(size=6, opacity=0.9),
+            name="TIN punktid",
+            hoverinfo="skip",
+        )
+    )
 
-# "Click layer" – läbipaistev markerikiht suuremate markeritega,
-# et click registreeruks ka siis, kui sa ei taba täpselt punkti.
-fig.add_trace(go.Scatter(
-    x=x.tolist(),
-    y=y.tolist(),
-    mode="markers",
-    marker=dict(size=18, opacity=0.0),  # täiesti nähtamatu
-    name="click_layer",
-    hoverinfo="skip",
-    showlegend=False,
-))
+    # Invisible click layer (bigger markers, opacity 0)
+    fig.add_trace(
+        go.Scatter(
+            x=x.tolist(),
+            y=y.tolist(),
+            mode="markers",
+            marker=dict(size=22, opacity=0.0),
+            name="click_layer",
+            hoverinfo="skip",
+            showlegend=False,
+        )
+    )
 
-
-    # axis abs -> local, also tolist()
+    # Axis: ABS -> LOCAL
     if axis_xy_abs:
         xs = [(p[0] - x0) for p in axis_xy_abs]
         ys = [(p[1] - y0) for p in axis_xy_abs]
-        fig.add_trace(go.Scatter(
-            x=xs,
-            y=ys,
-            mode="lines+markers",
-            line=dict(width=4),
-            marker=dict(size=9),
-            name="Telg",
-        ))
+        fig.add_trace(
+            go.Scatter(
+                x=xs,
+                y=ys,
+                mode="lines+markers",
+                line=dict(width=4),
+                marker=dict(size=9),
+                name="Telg",
+            )
+        )
 
         L = polyline_length(axis_xy_abs)
         fig.add_annotation(
-            x=xs[-1], y=ys[-1],
+            x=xs[-1],
+            y=ys[-1],
             text=f"{L:.2f} m",
             showarrow=True,
             arrowhead=2,
-            ax=30, ay=-30
+            ax=30,
+            ay=-30,
         )
 
     fig.update_layout(
@@ -133,11 +149,12 @@ fig.add_trace(go.Scatter(
     )
 
     fig.add_annotation(
-        x=xmin - pad_x, y=ymin - pad_y,
+        x=xmin - pad_x,
+        y=ymin - pad_y,
         text=f"Lokaalne (0,0) = E {x0:.3f}, N {y0:.3f}",
         showarrow=False,
         xanchor="left",
-        yanchor="bottom"
+        yanchor="bottom",
     )
 
     fig.update_xaxes(title="E (local, m)", range=[xmin - pad_x, xmax + pad_x])
@@ -146,30 +163,31 @@ fig.add_trace(go.Scatter(
     return fig
 
 
-
+# -------------------------
+# Main view
+# -------------------------
 def render_projects_view():
     st.title("Projects")
 
     s3 = get_s3()
     projects = list_projects()
 
-    if "active_project_id" not in st.session_state:
-        st.session_state["active_project_id"] = None
+    # Session state defaults
+    st.session_state.setdefault("active_project_id", None)
 
     # Axis stored in ABS coords (E,N)
-    if "axis_xy" not in st.session_state:
-        st.session_state["axis_xy"] = []
-    if "axis_finished" not in st.session_state:
-        st.session_state["axis_finished"] = False
+    st.session_state.setdefault("axis_xy", [])
+    st.session_state.setdefault("axis_finished", False)
 
-    if "landxml_bytes" not in st.session_state:
-        st.session_state["landxml_bytes"] = None
-    if "landxml_key" not in st.session_state:
-        st.session_state["landxml_key"] = None
+    # LandXML for current session
+    st.session_state.setdefault("landxml_bytes", None)
+    st.session_state.setdefault("landxml_key", None)
 
-    # origin used for plotting (ABS coords)
-    if "plot_origin" not in st.session_state:
-        st.session_state["plot_origin"] = None  # (E0,N0)
+    # Plot origin (ABS coords) for stable local plotting
+    st.session_state.setdefault("plot_origin", None)
+
+    # Cached display points (so click-snap/click-layer stable)
+    st.session_state.setdefault("xyz_show_cache", None)
 
     # ---------------- Create project ----------------
     st.markdown('<div class="block">', unsafe_allow_html=True)
@@ -207,11 +225,14 @@ def render_projects_view():
         for proj in projects:
             if st.button(proj["name"], use_container_width=True, key=f"projbtn_{proj['id']}"):
                 st.session_state["active_project_id"] = proj["id"]
+
+                # reset geometry/session per project switch
                 st.session_state["axis_xy"] = []
                 st.session_state["axis_finished"] = False
                 st.session_state["landxml_bytes"] = None
                 st.session_state["landxml_key"] = None
                 st.session_state["plot_origin"] = None
+                st.session_state["xyz_show_cache"] = None
                 st.rerun()
 
     with right:
@@ -241,9 +262,14 @@ def render_projects_view():
 
             st.session_state["landxml_bytes"] = xml_bytes
             st.session_state["landxml_key"] = key
+
+            # reset axis
             st.session_state["axis_xy"] = []
             st.session_state["axis_finished"] = False
+
+            # reset plot origin/cache
             st.session_state["plot_origin"] = None
+            st.session_state["xyz_show_cache"] = None
 
             st.success("LandXML salvestatud ja laaditud sessiooni.")
             st.rerun()
@@ -259,21 +285,22 @@ def render_projects_view():
             st.info("Lae LandXML üles, et saaks telge joonistada.")
             st.markdown("</div>", unsafe_allow_html=True)
         else:
+            # Read points once per session (fast enough for your size)
             try:
                 pts_dict, _faces = read_landxml_tin_from_bytes(xml_bytes)
                 xyz = np.array(list(pts_dict.values()), dtype=float)
 
-                # downsample for display
                 xyz_show = _downsample_points(xyz, max_pts=60000)
+                st.session_state["xyz_show_cache"] = xyz_show
 
-                # set plot origin once (ABS)
+                # origin once
                 if st.session_state["plot_origin"] is None:
-                    x0 = float(np.mean(xyz_show[:, 0]))
-                    y0 = float(np.mean(xyz_show[:, 1]))
+                    # NB: use mean of DISPLAY points; stable for local plotting
+                    x0 = float(np.nanmean(xyz_show[:, 0]))
+                    y0 = float(np.nanmean(xyz_show[:, 1]))
                     st.session_state["plot_origin"] = (x0, y0)
 
-                # debug (võid hiljem eemaldada)
-                st.caption(f"Punkte kokku: {xyz.shape[0]} | Näitan: {xyz_show.shape[0]}")
+                # Debug header (you can remove later)
                 st.caption(
                     f"ABS X min/max: {np.nanmin(xyz_show[:,0]):.3f} / {np.nanmax(xyz_show[:,0]):.3f} | "
                     f"ABS Y min/max: {np.nanmin(xyz_show[:,1]):.3f} / {np.nanmax(xyz_show[:,1]):.3f}"
@@ -284,23 +311,27 @@ def render_projects_view():
                 st.markdown("</div>", unsafe_allow_html=True)
                 return
 
+            # Buttons row
             cA, cB, cC, cD = st.columns([1, 1, 1, 2])
             with cA:
                 if st.button("Alusta / joonista telg", use_container_width=True):
                     st.session_state["axis_xy"] = []
                     st.session_state["axis_finished"] = False
                     st.rerun()
+
             with cB:
                 if st.button("Undo (eemalda viimane)", use_container_width=True):
                     if st.session_state["axis_xy"]:
                         st.session_state["axis_xy"] = st.session_state["axis_xy"][:-1]
                         st.session_state["axis_finished"] = False
                         st.rerun()
+
             with cC:
                 if st.button("Tühjenda telg", use_container_width=True):
                     st.session_state["axis_xy"] = []
                     st.session_state["axis_finished"] = False
                     st.rerun()
+
             with cD:
                 if st.button("Lõpeta telg", use_container_width=True):
                     if len(st.session_state["axis_xy"]) < 2:
@@ -313,10 +344,14 @@ def render_projects_view():
             axis_xy_abs = st.session_state["axis_xy"]
             finished = st.session_state["axis_finished"]
             origin_abs = st.session_state["plot_origin"]
+            xyz_show = st.session_state["xyz_show_cache"]
 
+            # Figure
             fig = _make_tin_figure(xyz_show, axis_xy_abs, origin_abs)
 
-            st.caption("👉 Klikk graafikul lisab telje punkti. Zoom/pan töötab Plotly toolbarist.")
+            st.caption("👉 Klikk punktile lisab telje punkti. Zoom/pan töötab Plotly toolbarist.")
+
+            # NOTE: No "config=" here (your earlier error). Keep simple.
             click_data = plotly_events(
                 fig,
                 click_event=True,
@@ -326,31 +361,37 @@ def render_projects_view():
                 key="tin_plot_events",
             )
 
-            # click gives LOCAL coords (because plot is local) => convert back to ABS for saving
-            if click_data and not finished:
-                x_local = float(click_data[0]["x"])
-                y_local = float(click_data[0]["y"])
+            # Click handling: click is LOCAL coords -> convert back to ABS -> store
+            if (click_data and len(click_data) > 0) and not finished:
+                x_local = float(click_data[0].get("x"))
+                y_local = float(click_data[0].get("y"))
+
                 x0, y0 = origin_abs
                 x_abs = x_local + x0
                 y_abs = y_local + y0
+
                 st.session_state["axis_xy"] = axis_xy_abs + [(x_abs, y_abs)]
                 st.rerun()
 
+            # Axis info
             if axis_xy_abs:
                 L = polyline_length(axis_xy_abs)
                 st.write(f"**Telje pikkus:** {L:.2f} m  |  Punkte: {len(axis_xy_abs)}")
 
+            # Parameters
             st.markdown("### Arvutusparameetrid")
-
             c1, c2, c3 = st.columns(3)
+
             with c1:
                 pk_step = st.number_input("PK samm (m)", min_value=0.1, value=1.0, step=0.1)
                 cross_len = st.number_input("Ristlõike kogupikkus (m)", min_value=2.0, value=25.0, step=1.0)
                 sample_step = st.number_input("Proovipunkti samm (m)", min_value=0.02, value=0.1, step=0.01)
+
             with c2:
                 tol = st.number_input("Tasase tolerants (m)", min_value=0.001, value=0.05, step=0.005)
                 min_run = st.number_input("Min tasane lõik (m)", min_value=0.05, value=0.2, step=0.05)
                 min_depth = st.number_input("Min kõrgus põhjast (m)", min_value=0.0, value=0.3, step=0.05)
+
             with c3:
                 slope = st.text_input("Nõlva kalle (nt 1:2)", value="1:2")
                 bottom_w = st.number_input("Põhja laius b (m)", min_value=0.0, value=0.40, step=0.05)
@@ -373,7 +414,6 @@ def render_projects_view():
                     )
 
                     df = pd.DataFrame(res["rows"])
-
                     st.success(f"✅ Kokku maht: {res['total_volume_m3']:.3f} m³")
                     st.write(f"Telje pikkus: **{res['axis_length_m']:.2f} m** | PK-sid: **{res['count']}**")
 
@@ -381,7 +421,7 @@ def render_projects_view():
                     if res["axis_length_m"] > 0 and res["total_volume_m3"] is not None:
                         planned_area = float(res["total_volume_m3"] / res["axis_length_m"])
 
-                    key = st.session_state["landxml_key"] or p.get("landxml_key") or ""
+                    key = st.session_state.get("landxml_key") or (p.get("landxml_key") or "")
                     set_project_landxml(
                         p["id"],
                         landxml_key=key,
@@ -398,11 +438,12 @@ def render_projects_view():
                         data=csv,
                         file_name=f"{p['name']}_pk_tabel.csv",
                         mime="text/csv",
-                        use_container_width=True
+                        use_container_width=True,
                     )
 
                     st.info("Tulemused salvestati projekti planned_* väljade alla (DB).")
 
+            # Show saved planned values
             p2 = get_project(pid)
             if p2 and p2.get("planned_volume_m3") is not None:
                 st.markdown("### Projekti salvestatud planeeritud väärtused")
