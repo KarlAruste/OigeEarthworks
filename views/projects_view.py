@@ -1,9 +1,11 @@
 # views/projects_view.py
+# Canvas-põhine telje joonistamine Streamlitis (Renderis töökindel: klikid tulevad alati tagasi)
+
+import json
 import streamlit as st
 from datetime import date
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 
 from db import (
     list_projects,
@@ -30,7 +32,9 @@ from landxml import (
 # -------------------------
 # Helpers
 # -------------------------
-def _downsample_points(xyz: np.ndarray, max_pts: int = 60000) -> np.ndarray:
+
+def _downsample_points(xyz: np.ndarray, max_pts: int = 20000) -> np.ndarray:
+    """Downsample to keep the canvas fast."""
     if xyz is None or xyz.size == 0:
         return xyz
     n = xyz.shape[0]
@@ -40,23 +44,29 @@ def _downsample_points(xyz: np.ndarray, max_pts: int = 60000) -> np.ndarray:
     return xyz[idx]
 
 
-def _nearest_point_abs_from_click_local(
-    click_local_xy: tuple[float, float],
-    xyz_show_abs: np.ndarray,
-    origin_abs: tuple[float, float],
-) -> tuple[float, float]:
-    """
-    click_local_xy: (x_local, y_local) from the plot (LOCAL coords)
-    xyz_show_abs: downsampled ABS points used for plotting
-    origin_abs: (E0, N0) used for local plot origin
-    returns: snapped ABS (E,N)
-    """
-    x0, y0 = origin_abs
-    cx_abs = click_local_xy[0] + x0
-    cy_abs = click_local_xy[1] + y0
+def _origin_abs(xyz_show_abs: np.ndarray) -> tuple[float, float]:
+    x0 = float(np.nanmean(xyz_show_abs[:, 0]))
+    y0 = float(np.nanmean(xyz_show_abs[:, 1]))
+    return (x0, y0)
 
-    if xyz_show_abs is None or xyz_show_abs.size == 0:
-        return (cx_abs, cy_abs)
+
+def _abs_to_local(xyz_abs: np.ndarray, origin: tuple[float, float]) -> np.ndarray:
+    x0, y0 = origin
+    out = xyz_abs.copy()
+    out[:, 0] = out[:, 0] - x0
+    out[:, 1] = out[:, 1] - y0
+    return out
+
+
+def _nearest_point_abs_from_local(
+    local_xy: tuple[float, float],
+    xyz_show_abs: np.ndarray,
+    origin_abs_: tuple[float, float],
+) -> tuple[float, float]:
+    """Snap local click to nearest (displayed) ABS point."""
+    x0, y0 = origin_abs_
+    cx_abs = float(local_xy[0] + x0)
+    cy_abs = float(local_xy[1] + y0)
 
     X = xyz_show_abs[:, 0].astype(float)
     Y = xyz_show_abs[:, 1].astype(float)
@@ -72,159 +82,274 @@ def _nearest_point_abs_from_click_local(
     return (float(X[j]), float(Y[j]))
 
 
-def _extract_selected_point(sel):
+# -------------------------
+# Canvas component (no build step)
+# -------------------------
+
+def canvas_pick_point(points_local_xy: np.ndarray, axis_local_xy: list[tuple[float, float]]):
+    """Interactive HTML5 canvas: pan+zoom with mouse, click selects nearest point.
+
+    Returns dict like:
+      {"x": local_x, "y": local_y, "picked": true}
+    or None.
+
+    NOTE: We use Streamlit's iframe postMessage protocol to send values back.
     """
-    Streamlit st.plotly_chart(on_select="rerun") returns a selection payload.
-    This function tries to extract the first selected point robustly across versions.
-    Returns dict with at least keys x,y and maybe point_index/curve_number.
+    import streamlit.components.v1 as components
+
+    pts = points_local_xy[:, :2].astype(float)
+    # keep payload light
+    pts_list = pts.tolist()
+    axis_list = [(float(a), float(b)) for (a, b) in axis_local_xy]
+
+    payload = {
+        "points": pts_list,
+        "axis": axis_list,
+    }
+
+    html = f"""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    html, body {{ margin:0; padding:0; height:100%; width:100%; overflow:hidden; background:#fff; }}
+    #wrap {{ position:relative; height:100%; width:100%; }}
+    #hud {{ position:absolute; left:12px; top:10px; background:rgba(255,255,255,0.92); padding:8px 10px; border:1px solid #ddd; border-radius:8px; font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial; font-size:13px; }}
+    #hud b {{ font-weight:600; }}
+    canvas {{ display:block; }}
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <div id="hud">
+      <div><b>Canvas</b> — Pan: lohista | Zoom: rullik | Kliki: vali lähim punkt</div>
+      <div id="info">—</div>
+    </div>
+    <canvas id="c"></canvas>
+  </div>
+
+<script>
+  const data = {json.dumps(payload)};
+  const pts = data.points; // [[x,y],...]
+  const axis = data.axis;  // [[x,y],...]
+
+  const canvas = document.getElementById('c');
+  const info = document.getElementById('info');
+  const ctx = canvas.getContext('2d');
+
+  function resize() {{
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.floor(canvas.clientWidth * dpr);
+    canvas.height = Math.floor(canvas.clientHeight * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    draw();
+  }}
+
+  // Fit view
+  function bounds() {{
+    let xmin=Infinity, xmax=-Infinity, ymin=Infinity, ymax=-Infinity;
+    for (const [x,y] of pts) {{
+      if (x<xmin) xmin=x; if (x>xmax) xmax=x;
+      if (y<ymin) ymin=y; if (y>ymax) ymax=y;
+    }}
+    if (!isFinite(xmin)) {{ xmin=-1; xmax=1; ymin=-1; ymax=1; }}
+    return {{xmin,xmax,ymin,ymax}};
+  }}
+
+  let view = {{
+    scale: 1,
+    ox: 0,
+    oy: 0,
+  }};
+
+  function fit() {{
+    const {{xmin,xmax,ymin,ymax}} = bounds();
+    const w = canvas.clientWidth;
+    const h = canvas.clientHeight;
+    const dx = (xmax-xmin) || 1;
+    const dy = (ymax-ymin) || 1;
+    const sx = (w*0.85) / dx;
+    const sy = (h*0.85) / dy;
+    view.scale = Math.min(sx, sy);
+    // center
+    const cx = (xmin+xmax)/2;
+    const cy = (ymin+ymax)/2;
+    view.ox = w/2 - cx*view.scale;
+    view.oy = h/2 + cy*view.scale; // y flip
+  }}
+
+  function worldToScreen(x,y) {{
+    const sx = x*view.scale + view.ox;
+    const sy = -y*view.scale + view.oy;
+    return [sx,sy];
+  }}
+
+  function screenToWorld(sx,sy) {{
+    const x = (sx - view.ox)/view.scale;
+    const y = -(sy - view.oy)/view.scale;
+    return [x,y];
+  }}
+
+  function draw() {{
+    const w = canvas.clientWidth;
+    const h = canvas.clientHeight;
+    ctx.clearRect(0,0,w,h);
+
+    // light grid
+    ctx.save();
+    ctx.strokeStyle = '#eef2f6';
+    ctx.lineWidth = 1;
+    const step = 50;
+    for (let x=0; x<=w; x+=step) {{ ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,h); ctx.stroke(); }}
+    for (let y=0; y<=h; y+=step) {{ ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke(); }}
+    ctx.restore();
+
+    // points
+    ctx.save();
+    ctx.fillStyle = 'rgba(75, 110, 255, 0.85)';
+    for (let i=0; i<pts.length; i++) {{
+      const [x,y] = pts[i];
+      const [sx,sy] = worldToScreen(x,y);
+      // skip far outside
+      if (sx<-10 || sy<-10 || sx>w+10 || sy>h+10) continue;
+      ctx.beginPath();
+      ctx.arc(sx,sy,2.4,0,Math.PI*2);
+      ctx.fill();
+    }}
+    ctx.restore();
+
+    // axis polyline
+    if (axis && axis.length>0) {{
+      ctx.save();
+      ctx.strokeStyle = '#f59e0b';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      for (let i=0; i<axis.length; i++) {{
+        const [x,y] = axis[i];
+        const [sx,sy] = worldToScreen(x,y);
+        if (i===0) ctx.moveTo(sx,sy); else ctx.lineTo(sx,sy);
+      }}
+      ctx.stroke();
+
+      ctx.fillStyle = '#f59e0b';
+      for (let i=0; i<axis.length; i++) {{
+        const [x,y] = axis[i];
+        const [sx,sy] = worldToScreen(x,y);
+        ctx.beginPath(); ctx.arc(sx,sy,5,0,Math.PI*2); ctx.fill();
+      }}
+      ctx.restore();
+    }}
+
+    // axes crosshair
+    ctx.save();
+    ctx.strokeStyle = '#11182733';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(w/2,0); ctx.lineTo(w/2,h); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0,h/2); ctx.lineTo(w,h/2); ctx.stroke();
+    ctx.restore();
+  }}
+
+  // interaction
+  let dragging=false;
+  let lastX=0, lastY=0;
+
+  canvas.addEventListener('mousedown', (e) => {{
+    dragging = true;
+    lastX = e.offsetX;
+    lastY = e.offsetY;
+  }});
+
+  window.addEventListener('mouseup', () => {{ dragging=false; }});
+
+  canvas.addEventListener('mousemove', (e) => {{
+    if (!dragging) return;
+    const dx = e.offsetX - lastX;
+    const dy = e.offsetY - lastY;
+    lastX = e.offsetX;
+    lastY = e.offsetY;
+    view.ox += dx;
+    view.oy += dy;
+    draw();
+  }});
+
+  canvas.addEventListener('wheel', (e) => {{
+    e.preventDefault();
+    const mouseX = e.offsetX;
+    const mouseY = e.offsetY;
+    const [wx, wy] = screenToWorld(mouseX, mouseY);
+
+    const zoom = Math.exp(-e.deltaY * 0.001);
+    const newScale = Math.min(2000, Math.max(0.01, view.scale * zoom));
+
+    // keep mouse point fixed
+    view.ox = mouseX - wx*newScale;
+    view.oy = mouseY + wy*newScale;
+    view.scale = newScale;
+    draw();
+  }}, {{ passive:false }});
+
+  function sendValue(val) {{
+    // Streamlit component protocol (works inside components.html iframe)
+    window.parent.postMessage({{
+      isStreamlitMessage: true,
+      type: 'streamlit:setComponentValue',
+      value: val
+    }}, '*');
+  }}
+
+  function nearestPoint(wx, wy) {{
+    // brute force (pts <= 20k)
+    let best=-1; let bestD=Infinity;
+    for (let i=0; i<pts.length; i++) {{
+      const dx = pts[i][0]-wx;
+      const dy = pts[i][1]-wy;
+      const d = dx*dx + dy*dy;
+      if (d < bestD) {{ bestD=d; best=i; }}
+    }}
+    return best;
+  }}
+
+  canvas.addEventListener('click', (e) => {{
+    // ignore click if it was a drag
+    const [wx, wy] = screenToWorld(e.offsetX, e.offsetY);
+    const idx = nearestPoint(wx, wy);
+    if (idx < 0) return;
+    const px = pts[idx][0];
+    const py = pts[idx][1];
+    info.textContent = `Valitud (local): E=${{px.toFixed(3)}}, N=${{py.toFixed(3)}}`;
+    sendValue({{picked:true, x:px, y:py}});
+  }});
+
+  // init
+  const wrap = document.getElementById('wrap');
+  function setSize() {{
+    canvas.style.width = '100%';
+    canvas.style.height = '650px';
+    resize();
+  }}
+
+  setSize();
+  fit();
+  draw();
+  window.addEventListener('resize', () => {{ resize(); }});
+
+  // Tell Streamlit our preferred height
+  window.parent.postMessage({{ isStreamlitMessage:true, type:'streamlit:setFrameHeight', height: 670 }}, '*');
+</script>
+</body>
+</html>
     """
-    if sel is None:
-        return None
 
-    # Newer Streamlit returns dict-like object
-    if isinstance(sel, dict):
-        selection = sel.get("selection") or {}
-        pts = selection.get("points") or []
-        if pts:
-            return pts[0]
-        return None
-
-    # Some versions expose attributes
-    try:
-        selection = getattr(sel, "selection", None)
-        if selection and isinstance(selection, dict):
-            pts = selection.get("points") or []
-            if pts:
-                return pts[0]
-    except Exception:
-        pass
-
-    return None
-
-
-def _make_tin_figure(
-    xyz_show_abs: np.ndarray,
-    axis_xy_abs: list[tuple[float, float]],
-    origin_abs: tuple[float, float],
-):
-    """
-    Plot in LOCAL coords for stable web rendering.
-    Use clickmode=event+select so Streamlit can capture selected point.
-    Add an invisible click-layer (bigger markers) so it's easy to select a point.
-    """
-    fig = go.Figure()
-
-    if xyz_show_abs is None or xyz_show_abs.size == 0:
-        fig.update_layout(
-            height=620,
-            title="TIN punkte ei leitud (kontrolli LandXML)",
-            margin=dict(l=10, r=10, t=40, b=10),
-        )
-        return fig
-
-    x_abs = np.asarray(xyz_show_abs[:, 0], dtype=float)
-    y_abs = np.asarray(xyz_show_abs[:, 1], dtype=float)
-    m = np.isfinite(x_abs) & np.isfinite(y_abs)
-    x_abs = x_abs[m]
-    y_abs = y_abs[m]
-    if x_abs.size < 2:
-        fig.update_layout(
-            height=620,
-            title="TIN punktid on vigased (NaN/Inf) või liiga vähe punkte",
-            margin=dict(l=10, r=10, t=40, b=10),
-        )
-        return fig
-
-    x0, y0 = origin_abs
-    x = x_abs - x0
-    y = y_abs - y0
-
-    xmin, xmax = float(np.min(x)), float(np.max(x))
-    ymin, ymax = float(np.min(y)), float(np.max(y))
-    dx = (xmax - xmin) if (xmax > xmin) else 1.0
-    dy = (ymax - ymin) if (ymax > ymin) else 1.0
-    pad_x = dx * 0.05
-    pad_y = dy * 0.05
-
-    # Visible points
-    fig.add_trace(
-        go.Scatter(
-            x=x.tolist(),
-            y=y.tolist(),
-            mode="markers",
-            marker=dict(size=6, opacity=0.9),
-            name="TIN punktid",
-            hoverinfo="skip",
-        )
-    )
-
-    # Invisible click-layer (same points, bigger marker, opacity 0)
-    fig.add_trace(
-        go.Scatter(
-            x=x.tolist(),
-            y=y.tolist(),
-            mode="markers",
-            marker=dict(size=22, opacity=0.0),
-            name="click_layer",
-            hoverinfo="skip",
-            showlegend=False,
-        )
-    )
-
-    # Axis (ABS -> LOCAL)
-    if axis_xy_abs:
-        xs = [(p[0] - x0) for p in axis_xy_abs]
-        ys = [(p[1] - y0) for p in axis_xy_abs]
-        fig.add_trace(
-            go.Scatter(
-                x=xs,
-                y=ys,
-                mode="lines+markers",
-                line=dict(width=4),
-                marker=dict(size=9),
-                name="Telg",
-            )
-        )
-        L = polyline_length(axis_xy_abs)
-        fig.add_annotation(
-            x=xs[-1],
-            y=ys[-1],
-            text=f"{L:.2f} m",
-            showarrow=True,
-            arrowhead=2,
-            ax=30,
-            ay=-30,
-        )
-
-    fig.update_layout(
-        height=620,
-        margin=dict(l=10, r=10, t=40, b=10),
-        title="Pealtvaade (lokaalne; kliki telje punktide lisamiseks)",
-        legend=dict(orientation="h"),
-        dragmode="pan",
-        uirevision="keep",
-        template="plotly_white",
-        clickmode="event+select",
-    )
-
-    fig.add_annotation(
-        x=xmin - pad_x,
-        y=ymin - pad_y,
-        text=f"Lokaalne (0,0) = E {x0:.3f}, N {y0:.3f}",
-        showarrow=False,
-        xanchor="left",
-        yanchor="bottom",
-    )
-
-    fig.update_xaxes(title="E (local, m)", range=[xmin - pad_x, xmax + pad_x])
-    fig.update_yaxes(title="N (local, m)", range=[ymin - pad_y, ymax + pad_y], scaleanchor="x", scaleratio=1)
-
-    return fig
+    # components.html returns the last value set by streamlit:setComponentValue
+    value = components.html(html, height=670, scrolling=False)
+    return value
 
 
 # -------------------------
 # Main view
 # -------------------------
+
 def render_projects_view():
     st.title("Projects")
 
@@ -233,13 +358,12 @@ def render_projects_view():
 
     # Session defaults
     st.session_state.setdefault("active_project_id", None)
-    st.session_state.setdefault("axis_xy", [])          # ABS coords list[(E,N)]
+    st.session_state.setdefault("axis_xy", [])          # ABS [(E,N)]
     st.session_state.setdefault("axis_finished", False)
     st.session_state.setdefault("landxml_bytes", None)
     st.session_state.setdefault("landxml_key", None)
-    st.session_state.setdefault("plot_origin", None)    # ABS (E0,N0) for local plot
-    st.session_state.setdefault("xyz_show_cache", None) # ABS downsample points
-    st.session_state.setdefault("last_click_sig", None) # avoid duplicate add on rerun
+    st.session_state.setdefault("plot_origin", None)    # ABS (E0,N0)
+    st.session_state.setdefault("xyz_show_cache", None) # ABS points for display/snap
 
     # ---------------- Create project ----------------
     st.markdown('<div class="block">', unsafe_allow_html=True)
@@ -283,7 +407,6 @@ def render_projects_view():
                 st.session_state["landxml_key"] = None
                 st.session_state["plot_origin"] = None
                 st.session_state["xyz_show_cache"] = None
-                st.session_state["last_click_sig"] = None
                 st.rerun()
 
     with right:
@@ -318,7 +441,6 @@ def render_projects_view():
             st.session_state["axis_finished"] = False
             st.session_state["plot_origin"] = None
             st.session_state["xyz_show_cache"] = None
-            st.session_state["last_click_sig"] = None
 
             st.success("LandXML salvestatud ja laaditud sessiooni.")
             st.rerun()
@@ -334,48 +456,42 @@ def render_projects_view():
             st.info("Lae LandXML üles, et saaks telge joonistada.")
             st.markdown("</div>", unsafe_allow_html=True)
         else:
-            # Read/caches
+            # read/cache points
             try:
                 pts_dict, _faces = read_landxml_tin_from_bytes(xml_bytes)
-                xyz = np.array(list(pts_dict.values()), dtype=float)
-
-                xyz_show = _downsample_points(xyz, max_pts=60000)
+                xyz = np.array(list(pts_dict.values()), dtype=float)  # columns: (E,N,Z) OR (N,E,Z) is handled in landxml.py
+                xyz_show = _downsample_points(xyz, max_pts=20000)
                 st.session_state["xyz_show_cache"] = xyz_show
 
                 if st.session_state["plot_origin"] is None:
-                    x0 = float(np.nanmean(xyz_show[:, 0]))
-                    y0 = float(np.nanmean(xyz_show[:, 1]))
-                    st.session_state["plot_origin"] = (x0, y0)
+                    st.session_state["plot_origin"] = _origin_abs(xyz_show)
 
-                st.caption(
-                    f"ABS X min/max: {np.nanmin(xyz_show[:,0]):.3f} / {np.nanmax(xyz_show[:,0]):.3f} | "
-                    f"ABS Y min/max: {np.nanmin(xyz_show[:,1]):.3f} / {np.nanmax(xyz_show[:,1]):.3f}"
-                )
+                x_min = float(np.nanmin(xyz_show[:, 0])); x_max = float(np.nanmax(xyz_show[:, 0]))
+                y_min = float(np.nanmin(xyz_show[:, 1])); y_max = float(np.nanmax(xyz_show[:, 1]))
+                st.caption(f"ABS X min/max: {x_min:.3f} / {x_max:.3f} | ABS Y min/max: {y_min:.3f} / {y_max:.3f}")
+
             except Exception as e:
                 st.error(f"LandXML lugemine ebaõnnestus: {e}")
                 st.markdown("</div>", unsafe_allow_html=True)
                 return
 
-            # Buttons
+            # buttons
             cA, cB, cC, cD = st.columns([1, 1, 1, 2])
             with cA:
                 if st.button("Alusta / joonista telg", use_container_width=True):
                     st.session_state["axis_xy"] = []
                     st.session_state["axis_finished"] = False
-                    st.session_state["last_click_sig"] = None
                     st.rerun()
             with cB:
                 if st.button("Undo (eemalda viimane)", use_container_width=True):
                     if st.session_state["axis_xy"]:
                         st.session_state["axis_xy"] = st.session_state["axis_xy"][:-1]
                         st.session_state["axis_finished"] = False
-                        st.session_state["last_click_sig"] = None
                         st.rerun()
             with cC:
                 if st.button("Tühjenda telg", use_container_width=True):
                     st.session_state["axis_xy"] = []
                     st.session_state["axis_finished"] = False
-                    st.session_state["last_click_sig"] = None
                     st.rerun()
             with cD:
                 if st.button("Lõpeta telg", use_container_width=True):
@@ -388,51 +504,30 @@ def render_projects_view():
 
             axis_xy_abs = st.session_state["axis_xy"]
             finished = st.session_state["axis_finished"]
-            origin_abs = st.session_state["plot_origin"]
+            origin = st.session_state["plot_origin"]
             xyz_show_abs = st.session_state["xyz_show_cache"]
 
-            fig = _make_tin_figure(xyz_show_abs, axis_xy_abs, origin_abs)
+            # Canvas render (LOCAL)
+            xyz_show_local = _abs_to_local(xyz_show_abs, origin)
+            axis_local = [(a - origin[0], b - origin[1]) for (a, b) in axis_xy_abs]
 
-            st.caption("👉 Kliki punktile/joonele – lisab teljele LÄHIMA TIN punkti (snap).")
-            st.caption("Zoom: hiirerull (scroll) töötab. Pan: lohista hiirega.")
+            st.caption("✅ Canvas: kliki kus tahes — lisab teljele lähima TIN punkti (snap). Zoom: rullik. Pan: lohista.")
 
-            # STREAMLIT NATIVE SELECTION (works on Render)
-            sel = st.plotly_chart(
-                fig,
-                use_container_width=True,
-                config={"scrollZoom": True, "displaylogo": False},
-                on_select="rerun",
-                selection_mode="points",
-                key="tin_plot",
-            )
+            picked = canvas_pick_point(xyz_show_local, axis_local)
 
-            picked = _extract_selected_point(sel)
-
-            if (not finished) and picked:
-                x_local = float(picked.get("x"))
-                y_local = float(picked.get("y"))
-
-                # signature to avoid double add on rerun
-                curve = int(picked.get("curve_number", picked.get("curveNumber", 0)))
-                pidx = int(picked.get("point_index", picked.get("pointIndex", -1)))
-                sig = (curve, pidx)
-
-                if sig != st.session_state.get("last_click_sig"):
-                    st.session_state["last_click_sig"] = sig
-
-                    x_abs, y_abs = _nearest_point_abs_from_click_local(
-                        (x_local, y_local),
-                        xyz_show_abs,
-                        origin_abs,
-                    )
-                    st.session_state["axis_xy"] = axis_xy_abs + [(x_abs, y_abs)]
-                    st.rerun()
+            if picked and isinstance(picked, dict) and picked.get("picked") and (not finished):
+                lx = float(picked.get("x"))
+                ly = float(picked.get("y"))
+                # snap using displayed ABS points
+                ax, ay = _nearest_point_abs_from_local((lx, ly), xyz_show_abs, origin)
+                st.session_state["axis_xy"] = axis_xy_abs + [(ax, ay)]
+                st.rerun()
 
             if axis_xy_abs:
                 L = polyline_length(axis_xy_abs)
                 st.write(f"**Telje pikkus:** {L:.2f} m  |  Punkte: {len(axis_xy_abs)}")
 
-            # Parameters
+            # parameters
             st.markdown("### Arvutusparameetrid")
             c1, c2, c3 = st.columns(3)
             with c1:
@@ -449,7 +544,7 @@ def render_projects_view():
 
             if st.button("Arvuta PK tabel (telje järgi)", use_container_width=True):
                 if len(axis_xy_abs) < 2:
-                    st.warning("Joonista telg enne arvutamist.")
+                    st.warning("Joonista telg enne arvutamist (vähemalt 2 punkti).")
                 else:
                     res = compute_pk_table_from_landxml(
                         xml_bytes=xml_bytes,
@@ -534,7 +629,7 @@ def render_projects_view():
             with bcol:
                 data = download_bytes(s3, f["key"])
                 st.download_button(
-                    "⬇️ Lae alla",
+                    "⬇️ Laadi alla",
                     data=data,
                     file_name=f["name"],
                     key=f"dl_{f['key']}",
