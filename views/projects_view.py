@@ -1,11 +1,10 @@
 # views/projects_view.py
-# Canvas-põhine telje joonistamine Streamlitis (Renderis töökindel: klikid tulevad alati tagasi)
 
-import json
 import streamlit as st
 from datetime import date
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 
 from db import (
     list_projects,
@@ -22,19 +21,21 @@ from r2 import (
     list_files,
     delete_key,
 )
+
 from landxml import (
     read_landxml_tin_from_bytes,
     compute_pk_table_from_landxml,
     polyline_length,
 )
 
+from streamlit_plotly_events import plotly_events
+
 
 # -------------------------
 # Helpers
 # -------------------------
 
-def _downsample_points(xyz: np.ndarray, max_pts: int = 20000) -> np.ndarray:
-    """Downsample to keep the canvas fast."""
+def _downsample_points(xyz: np.ndarray, max_pts: int = 60000) -> np.ndarray:
     if xyz is None or xyz.size == 0:
         return xyz
     n = xyz.shape[0]
@@ -44,306 +45,118 @@ def _downsample_points(xyz: np.ndarray, max_pts: int = 20000) -> np.ndarray:
     return xyz[idx]
 
 
-def _origin_abs(xyz_show_abs: np.ndarray) -> tuple[float, float]:
-    x0 = float(np.nanmean(xyz_show_abs[:, 0]))
-    y0 = float(np.nanmean(xyz_show_abs[:, 1]))
-    return (x0, y0)
+def _origin_abs(xyz_abs: np.ndarray) -> tuple[float, float]:
+    # origin = mean to keep local coords centered
+    x0 = float(np.nanmean(xyz_abs[:, 0]))
+    y0 = float(np.nanmean(xyz_abs[:, 1]))
+    return x0, y0
 
 
-def _abs_to_local(xyz_abs: np.ndarray, origin: tuple[float, float]) -> np.ndarray:
+def _abs_to_local_xy(xyz_abs: np.ndarray, origin: tuple[float, float]) -> np.ndarray:
     x0, y0 = origin
-    out = xyz_abs.copy()
-    out[:, 0] = out[:, 0] - x0
-    out[:, 1] = out[:, 1] - y0
+    out = xyz_abs[:, :2].astype(float).copy()
+    out[:, 0] -= x0
+    out[:, 1] -= y0
     return out
 
 
-def _nearest_point_abs_from_local(
-    local_xy: tuple[float, float],
-    xyz_show_abs: np.ndarray,
-    origin_abs_: tuple[float, float],
-) -> tuple[float, float]:
-    """Snap local click to nearest (displayed) ABS point."""
-    x0, y0 = origin_abs_
-    cx_abs = float(local_xy[0] + x0)
-    cy_abs = float(local_xy[1] + y0)
+def _axis_abs_to_local(axis_abs: list[tuple[float, float]], origin: tuple[float, float]) -> list[tuple[float, float]]:
+    x0, y0 = origin
+    return [(float(x - x0), float(y - y0)) for (x, y) in axis_abs]
 
-    X = xyz_show_abs[:, 0].astype(float)
-    Y = xyz_show_abs[:, 1].astype(float)
+
+def _snap_local_click_to_nearest_abs(
+    click_local_xy: tuple[float, float],
+    xyz_abs: np.ndarray,
+    origin: tuple[float, float],
+) -> tuple[float, float]:
+    """
+    click_local_xy is in local coords.
+    Snap to nearest xyz_abs point (but compute in local for numeric stability).
+    """
+    x0, y0 = origin
+    cx = float(click_local_xy[0])
+    cy = float(click_local_xy[1])
+
+    X = (xyz_abs[:, 0].astype(float) - x0)
+    Y = (xyz_abs[:, 1].astype(float) - y0)
+
     m = np.isfinite(X) & np.isfinite(Y)
+    if not np.any(m):
+        return (float(cx + x0), float(cy + y0))
+
     X = X[m]
     Y = Y[m]
-    if X.size == 0:
-        return (cx_abs, cy_abs)
-
-    dx = X - cx_abs
-    dy = Y - cy_abs
+    dx = X - cx
+    dy = Y - cy
     j = int(np.argmin(dx * dx + dy * dy))
-    return (float(X[j]), float(Y[j]))
+
+    # return ABS coords
+    return (float(X[j] + x0), float(Y[j] + y0))
 
 
-# -------------------------
-# Canvas component (no build step)
-# -------------------------
+def _make_plotly_fig(local_pts_xy: np.ndarray, axis_local_xy: list[tuple[float, float]]):
+    fig = go.Figure()
 
-def canvas_pick_point(points_local_xy: np.ndarray, axis_local_xy: list[tuple[float, float]]):
-    """Interactive HTML5 canvas: pan+zoom with mouse, click selects nearest point.
+    if local_pts_xy is None or local_pts_xy.size == 0:
+        fig.update_layout(
+            height=650,
+            title="TIN punkte ei leitud",
+            margin=dict(l=10, r=10, t=50, b=10),
+        )
+        return fig
 
-    Returns dict like:
-      {"x": local_x, "y": local_y, "picked": true}
-    or None.
+    x = local_pts_xy[:, 0]
+    y = local_pts_xy[:, 1]
 
-    NOTE: We use Streamlit's iframe postMessage protocol to send values back.
-    """
-    import streamlit.components.v1 as components
+    # show points
+    fig.add_trace(
+        go.Scattergl(
+            x=x,
+            y=y,
+            mode="markers",
+            marker=dict(size=4, opacity=0.7),
+            name="TIN punktid",
+            hoverinfo="skip",
+        )
+    )
 
-    pts = points_local_xy[:, :2].astype(float)
-    # keep payload light
-    pts_list = pts.tolist()
-    axis_list = [(float(a), float(b)) for (a, b) in axis_local_xy]
+    # axis
+    if axis_local_xy and len(axis_local_xy) > 0:
+        xs = [p[0] for p in axis_local_xy]
+        ys = [p[1] for p in axis_local_xy]
+        fig.add_trace(
+            go.Scatter(
+                x=xs,
+                y=ys,
+                mode="lines+markers",
+                line=dict(width=4),
+                marker=dict(size=10),
+                name="Telg",
+            )
+        )
 
-    payload = {
-        "points": pts_list,
-        "axis": axis_list,
-    }
+    # bounds / padding
+    xmin, xmax = float(np.min(x)), float(np.max(x))
+    ymin, ymax = float(np.min(y)), float(np.max(y))
+    dx = (xmax - xmin) if xmax > xmin else 1.0
+    dy = (ymax - ymin) if ymax > ymin else 1.0
+    pad_x = dx * 0.08
+    pad_y = dy * 0.08
 
-    html = f"""
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <style>
-    html, body {{ margin:0; padding:0; height:100%; width:100%; overflow:hidden; background:#fff; }}
-    #wrap {{ position:relative; height:100%; width:100%; }}
-    #hud {{ position:absolute; left:12px; top:10px; background:rgba(255,255,255,0.92); padding:8px 10px; border:1px solid #ddd; border-radius:8px; font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial; font-size:13px; }}
-    #hud b {{ font-weight:600; }}
-    canvas {{ display:block; }}
-  </style>
-</head>
-<body>
-  <div id="wrap">
-    <div id="hud">
-      <div><b>Canvas</b> — Pan: lohista | Zoom: rullik | Kliki: vali lähim punkt</div>
-      <div id="info">—</div>
-    </div>
-    <canvas id="c"></canvas>
-  </div>
+    fig.update_layout(
+        height=650,
+        title="Pealtvaade (lokaalne; kliki telje punktide lisamiseks)",
+        margin=dict(l=10, r=10, t=50, b=10),
+        dragmode="pan",
+        uirevision="keep",
+        clickmode="event+select",
+        legend=dict(orientation="h"),
+    )
+    fig.update_xaxes(title="E (local, m)", range=[xmin - pad_x, xmax + pad_x])
+    fig.update_yaxes(title="N (local, m)", range=[ymin - pad_y, ymax + pad_y], scaleanchor="x", scaleratio=1)
 
-<script>
-  const data = {json.dumps(payload)};
-  const pts = data.points; // [[x,y],...]
-  const axis = data.axis;  // [[x,y],...]
-
-  const canvas = document.getElementById('c');
-  const info = document.getElementById('info');
-  const ctx = canvas.getContext('2d');
-
-  function resize() {{
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = Math.floor(canvas.clientWidth * dpr);
-    canvas.height = Math.floor(canvas.clientHeight * dpr);
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    draw();
-  }}
-
-  // Fit view
-  function bounds() {{
-    let xmin=Infinity, xmax=-Infinity, ymin=Infinity, ymax=-Infinity;
-    for (const [x,y] of pts) {{
-      if (x<xmin) xmin=x; if (x>xmax) xmax=x;
-      if (y<ymin) ymin=y; if (y>ymax) ymax=y;
-    }}
-    if (!isFinite(xmin)) {{ xmin=-1; xmax=1; ymin=-1; ymax=1; }}
-    return {{xmin,xmax,ymin,ymax}};
-  }}
-
-  let view = {{
-    scale: 1,
-    ox: 0,
-    oy: 0,
-  }};
-
-  function fit() {{
-    const {{xmin,xmax,ymin,ymax}} = bounds();
-    const w = canvas.clientWidth;
-    const h = canvas.clientHeight;
-    const dx = (xmax-xmin) || 1;
-    const dy = (ymax-ymin) || 1;
-    const sx = (w*0.85) / dx;
-    const sy = (h*0.85) / dy;
-    view.scale = Math.min(sx, sy);
-    // center
-    const cx = (xmin+xmax)/2;
-    const cy = (ymin+ymax)/2;
-    view.ox = w/2 - cx*view.scale;
-    view.oy = h/2 + cy*view.scale; // y flip
-  }}
-
-  function worldToScreen(x,y) {{
-    const sx = x*view.scale + view.ox;
-    const sy = -y*view.scale + view.oy;
-    return [sx,sy];
-  }}
-
-  function screenToWorld(sx,sy) {{
-    const x = (sx - view.ox)/view.scale;
-    const y = -(sy - view.oy)/view.scale;
-    return [x,y];
-  }}
-
-  function draw() {{
-    const w = canvas.clientWidth;
-    const h = canvas.clientHeight;
-    ctx.clearRect(0,0,w,h);
-
-    // light grid
-    ctx.save();
-    ctx.strokeStyle = '#eef2f6';
-    ctx.lineWidth = 1;
-    const step = 50;
-    for (let x=0; x<=w; x+=step) {{ ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,h); ctx.stroke(); }}
-    for (let y=0; y<=h; y+=step) {{ ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke(); }}
-    ctx.restore();
-
-    // points
-    ctx.save();
-    ctx.fillStyle = 'rgba(75, 110, 255, 0.85)';
-    for (let i=0; i<pts.length; i++) {{
-      const [x,y] = pts[i];
-      const [sx,sy] = worldToScreen(x,y);
-      // skip far outside
-      if (sx<-10 || sy<-10 || sx>w+10 || sy>h+10) continue;
-      ctx.beginPath();
-      ctx.arc(sx,sy,2.4,0,Math.PI*2);
-      ctx.fill();
-    }}
-    ctx.restore();
-
-    // axis polyline
-    if (axis && axis.length>0) {{
-      ctx.save();
-      ctx.strokeStyle = '#f59e0b';
-      ctx.lineWidth = 3;
-      ctx.beginPath();
-      for (let i=0; i<axis.length; i++) {{
-        const [x,y] = axis[i];
-        const [sx,sy] = worldToScreen(x,y);
-        if (i===0) ctx.moveTo(sx,sy); else ctx.lineTo(sx,sy);
-      }}
-      ctx.stroke();
-
-      ctx.fillStyle = '#f59e0b';
-      for (let i=0; i<axis.length; i++) {{
-        const [x,y] = axis[i];
-        const [sx,sy] = worldToScreen(x,y);
-        ctx.beginPath(); ctx.arc(sx,sy,5,0,Math.PI*2); ctx.fill();
-      }}
-      ctx.restore();
-    }}
-
-    // axes crosshair
-    ctx.save();
-    ctx.strokeStyle = '#11182733';
-    ctx.lineWidth = 1;
-    ctx.beginPath(); ctx.moveTo(w/2,0); ctx.lineTo(w/2,h); ctx.stroke();
-    ctx.beginPath(); ctx.moveTo(0,h/2); ctx.lineTo(w,h/2); ctx.stroke();
-    ctx.restore();
-  }}
-
-  // interaction
-  let dragging=false;
-  let lastX=0, lastY=0;
-
-  canvas.addEventListener('mousedown', (e) => {{
-    dragging = true;
-    lastX = e.offsetX;
-    lastY = e.offsetY;
-  }});
-
-  window.addEventListener('mouseup', () => {{ dragging=false; }});
-
-  canvas.addEventListener('mousemove', (e) => {{
-    if (!dragging) return;
-    const dx = e.offsetX - lastX;
-    const dy = e.offsetY - lastY;
-    lastX = e.offsetX;
-    lastY = e.offsetY;
-    view.ox += dx;
-    view.oy += dy;
-    draw();
-  }});
-
-  canvas.addEventListener('wheel', (e) => {{
-    e.preventDefault();
-    const mouseX = e.offsetX;
-    const mouseY = e.offsetY;
-    const [wx, wy] = screenToWorld(mouseX, mouseY);
-
-    const zoom = Math.exp(-e.deltaY * 0.001);
-    const newScale = Math.min(2000, Math.max(0.01, view.scale * zoom));
-
-    // keep mouse point fixed
-    view.ox = mouseX - wx*newScale;
-    view.oy = mouseY + wy*newScale;
-    view.scale = newScale;
-    draw();
-  }}, {{ passive:false }});
-
-  function sendValue(val) {{
-    // Streamlit component protocol (works inside components.html iframe)
-    window.parent.postMessage({{
-      isStreamlitMessage: true,
-      type: 'streamlit:setComponentValue',
-      value: val
-    }}, '*');
-  }}
-
-  function nearestPoint(wx, wy) {{
-    // brute force (pts <= 20k)
-    let best=-1; let bestD=Infinity;
-    for (let i=0; i<pts.length; i++) {{
-      const dx = pts[i][0]-wx;
-      const dy = pts[i][1]-wy;
-      const d = dx*dx + dy*dy;
-      if (d < bestD) {{ bestD=d; best=i; }}
-    }}
-    return best;
-  }}
-
-  canvas.addEventListener('click', (e) => {{
-    // ignore click if it was a drag
-    const [wx, wy] = screenToWorld(e.offsetX, e.offsetY);
-    const idx = nearestPoint(wx, wy);
-    if (idx < 0) return;
-    const px = pts[idx][0];
-    const py = pts[idx][1];
-    info.textContent = `Valitud (local): E=${{px.toFixed(3)}}, N=${{py.toFixed(3)}}`;
-    sendValue({{picked:true, x:px, y:py}});
-  }});
-
-  // init
-  const wrap = document.getElementById('wrap');
-  function setSize() {{
-    canvas.style.width = '100%';
-    canvas.style.height = '650px';
-    resize();
-  }}
-
-  setSize();
-  fit();
-  draw();
-  window.addEventListener('resize', () => {{ resize(); }});
-
-  // Tell Streamlit our preferred height
-  window.parent.postMessage({{ isStreamlitMessage:true, type:'streamlit:setFrameHeight', height: 670 }}, '*');
-</script>
-</body>
-</html>
-    """
-
-    # components.html returns the last value set by streamlit:setComponentValue
-    value = components.html(html, height=670, scrolling=False)
-    return value
+    return fig
 
 
 # -------------------------
@@ -356,14 +169,14 @@ def render_projects_view():
     s3 = get_s3()
     projects = list_projects()
 
-    # Session defaults
+    # session defaults
     st.session_state.setdefault("active_project_id", None)
-    st.session_state.setdefault("axis_xy", [])          # ABS [(E,N)]
+    st.session_state.setdefault("axis_xy_abs", [])        # [(E,N)] ABS
     st.session_state.setdefault("axis_finished", False)
     st.session_state.setdefault("landxml_bytes", None)
     st.session_state.setdefault("landxml_key", None)
-    st.session_state.setdefault("plot_origin", None)    # ABS (E0,N0)
-    st.session_state.setdefault("xyz_show_cache", None) # ABS points for display/snap
+    st.session_state.setdefault("origin_abs", None)
+    st.session_state.setdefault("xyz_show_abs", None)     # ABS for display+snap
 
     # ---------------- Create project ----------------
     st.markdown('<div class="block">', unsafe_allow_html=True)
@@ -401,12 +214,12 @@ def render_projects_view():
         for proj in projects:
             if st.button(proj["name"], use_container_width=True, key=f"projbtn_{proj['id']}"):
                 st.session_state["active_project_id"] = proj["id"]
-                st.session_state["axis_xy"] = []
+                st.session_state["axis_xy_abs"] = []
                 st.session_state["axis_finished"] = False
                 st.session_state["landxml_bytes"] = None
                 st.session_state["landxml_key"] = None
-                st.session_state["plot_origin"] = None
-                st.session_state["xyz_show_cache"] = None
+                st.session_state["origin_abs"] = None
+                st.session_state["xyz_show_abs"] = None
                 st.rerun()
 
     with right:
@@ -436,11 +249,10 @@ def render_projects_view():
 
             st.session_state["landxml_bytes"] = xml_bytes
             st.session_state["landxml_key"] = key
-
-            st.session_state["axis_xy"] = []
+            st.session_state["axis_xy_abs"] = []
             st.session_state["axis_finished"] = False
-            st.session_state["plot_origin"] = None
-            st.session_state["xyz_show_cache"] = None
+            st.session_state["origin_abs"] = None
+            st.session_state["xyz_show_abs"] = None
 
             st.success("LandXML salvestatud ja laaditud sessiooni.")
             st.rerun()
@@ -455,148 +267,159 @@ def render_projects_view():
         if not xml_bytes:
             st.info("Lae LandXML üles, et saaks telge joonistada.")
             st.markdown("</div>", unsafe_allow_html=True)
-        else:
-            # read/cache points
-            try:
-                pts_dict, _faces = read_landxml_tin_from_bytes(xml_bytes)
-                xyz = np.array(list(pts_dict.values()), dtype=float)  # columns: (E,N,Z) OR (N,E,Z) is handled in landxml.py
-                xyz_show = _downsample_points(xyz, max_pts=20000)
-                st.session_state["xyz_show_cache"] = xyz_show
+            return
 
-                if st.session_state["plot_origin"] is None:
-                    st.session_state["plot_origin"] = _origin_abs(xyz_show)
+        # Read points
+        try:
+            pts_dict, _faces = read_landxml_tin_from_bytes(xml_bytes)
+            xyz_abs = np.array(list(pts_dict.values()), dtype=float)  # expects (E,N,Z) already handled in landxml.py
+            xyz_show_abs = _downsample_points(xyz_abs, max_pts=60000)
+            st.session_state["xyz_show_abs"] = xyz_show_abs
 
-                x_min = float(np.nanmin(xyz_show[:, 0])); x_max = float(np.nanmax(xyz_show[:, 0]))
-                y_min = float(np.nanmin(xyz_show[:, 1])); y_max = float(np.nanmax(xyz_show[:, 1]))
-                st.caption(f"ABS X min/max: {x_min:.3f} / {x_max:.3f} | ABS Y min/max: {y_min:.3f} / {y_max:.3f}")
+            if st.session_state["origin_abs"] is None:
+                st.session_state["origin_abs"] = _origin_abs(xyz_show_abs)
 
-            except Exception as e:
-                st.error(f"LandXML lugemine ebaõnnestus: {e}")
-                st.markdown("</div>", unsafe_allow_html=True)
-                return
+            x_min = float(np.nanmin(xyz_show_abs[:, 0])); x_max = float(np.nanmax(xyz_show_abs[:, 0]))
+            y_min = float(np.nanmin(xyz_show_abs[:, 1])); y_max = float(np.nanmax(xyz_show_abs[:, 1]))
+            st.caption(f"ABS X min/max: {x_min:.3f} / {x_max:.3f} | ABS Y min/max: {y_min:.3f} / {y_max:.3f}")
 
-            # buttons
-            cA, cB, cC, cD = st.columns([1, 1, 1, 2])
-            with cA:
-                if st.button("Alusta / joonista telg", use_container_width=True):
-                    st.session_state["axis_xy"] = []
-                    st.session_state["axis_finished"] = False
-                    st.rerun()
-            with cB:
-                if st.button("Undo (eemalda viimane)", use_container_width=True):
-                    if st.session_state["axis_xy"]:
-                        st.session_state["axis_xy"] = st.session_state["axis_xy"][:-1]
-                        st.session_state["axis_finished"] = False
-                        st.rerun()
-            with cC:
-                if st.button("Tühjenda telg", use_container_width=True):
-                    st.session_state["axis_xy"] = []
-                    st.session_state["axis_finished"] = False
-                    st.rerun()
-            with cD:
-                if st.button("Lõpeta telg", use_container_width=True):
-                    if len(st.session_state["axis_xy"]) < 2:
-                        st.warning("Telg peab olema vähemalt 2 punktiga.")
-                    else:
-                        st.session_state["axis_finished"] = True
-                        st.success("Telg lõpetatud.")
-                        st.rerun()
-
-            axis_xy_abs = st.session_state["axis_xy"]
-            finished = st.session_state["axis_finished"]
-            origin = st.session_state["plot_origin"]
-            xyz_show_abs = st.session_state["xyz_show_cache"]
-
-            # Canvas render (LOCAL)
-            xyz_show_local = _abs_to_local(xyz_show_abs, origin)
-            axis_local = [(a - origin[0], b - origin[1]) for (a, b) in axis_xy_abs]
-
-            st.caption("✅ Canvas: kliki kus tahes — lisab teljele lähima TIN punkti (snap). Zoom: rullik. Pan: lohista.")
-
-            picked = canvas_pick_point(xyz_show_local, axis_local)
-
-            if picked and isinstance(picked, dict) and picked.get("picked") and (not finished):
-                lx = float(picked.get("x"))
-                ly = float(picked.get("y"))
-                # snap using displayed ABS points
-                ax, ay = _nearest_point_abs_from_local((lx, ly), xyz_show_abs, origin)
-                st.session_state["axis_xy"] = axis_xy_abs + [(ax, ay)]
-                st.rerun()
-
-            if axis_xy_abs:
-                L = polyline_length(axis_xy_abs)
-                st.write(f"**Telje pikkus:** {L:.2f} m  |  Punkte: {len(axis_xy_abs)}")
-
-            # parameters
-            st.markdown("### Arvutusparameetrid")
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                pk_step = st.number_input("PK samm (m)", min_value=0.1, value=1.0, step=0.1)
-                cross_len = st.number_input("Ristlõike kogupikkus (m)", min_value=2.0, value=25.0, step=1.0)
-                sample_step = st.number_input("Proovipunkti samm (m)", min_value=0.02, value=0.1, step=0.01)
-            with c2:
-                tol = st.number_input("Tasase tolerants (m)", min_value=0.001, value=0.05, step=0.005)
-                min_run = st.number_input("Min tasane lõik (m)", min_value=0.05, value=0.2, step=0.05)
-                min_depth = st.number_input("Min kõrgus põhjast (m)", min_value=0.0, value=0.3, step=0.05)
-            with c3:
-                slope = st.text_input("Nõlva kalle (nt 1:2)", value="1:2")
-                bottom_w = st.number_input("Põhja laius b (m)", min_value=0.0, value=0.40, step=0.05)
-
-            if st.button("Arvuta PK tabel (telje järgi)", use_container_width=True):
-                if len(axis_xy_abs) < 2:
-                    st.warning("Joonista telg enne arvutamist (vähemalt 2 punkti).")
-                else:
-                    res = compute_pk_table_from_landxml(
-                        xml_bytes=xml_bytes,
-                        axis_xy=axis_xy_abs,
-                        pk_step=float(pk_step),
-                        cross_len=float(cross_len),
-                        sample_step=float(sample_step),
-                        tol=float(tol),
-                        min_run=float(min_run),
-                        min_depth_from_bottom=float(min_depth),
-                        slope_text=slope,
-                        bottom_w=float(bottom_w),
-                    )
-
-                    df = pd.DataFrame(res["rows"])
-                    st.success(f"✅ Kokku maht: {res['total_volume_m3']:.3f} m³")
-                    st.write(f"Telje pikkus: **{res['axis_length_m']:.2f} m** | PK-sid: **{res['count']}**")
-
-                    planned_area = None
-                    if res["axis_length_m"] > 0 and res["total_volume_m3"] is not None:
-                        planned_area = float(res["total_volume_m3"] / res["axis_length_m"])
-
-                    key = st.session_state.get("landxml_key") or (p.get("landxml_key") or "")
-                    set_project_landxml(
-                        p["id"],
-                        landxml_key=key,
-                        planned_volume_m3=float(res["total_volume_m3"]),
-                        planned_length_m=float(res["axis_length_m"]),
-                        planned_area_m2=planned_area,
-                    )
-
-                    st.dataframe(df, use_container_width=True)
-
-                    csv = df.to_csv(index=False, sep=";").encode("utf-8")
-                    st.download_button(
-                        "⬇️ Lae alla CSV",
-                        data=csv,
-                        file_name=f"{p['name']}_pk_tabel.csv",
-                        mime="text/csv",
-                        use_container_width=True,
-                    )
-
-                    st.info("Tulemused salvestati projekti planned_* väljade alla (DB).")
-
-            p2 = get_project(pid)
-            if p2 and p2.get("planned_volume_m3") is not None:
-                st.markdown("### Projekti salvestatud planeeritud väärtused")
-                st.write(f"**Planned length:** {float(p2['planned_length_m'] or 0):.2f} m")
-                st.write(f"**Planned area:** {float(p2['planned_area_m2'] or 0):.3f} m²")
-                st.write(f"**Planned volume:** {float(p2['planned_volume_m3'] or 0):.3f} m³")
-
+        except Exception as e:
+            st.error(f"LandXML lugemine ebaõnnestus: {e}")
             st.markdown("</div>", unsafe_allow_html=True)
+            return
+
+        # Buttons
+        cA, cB, cC, cD = st.columns([1, 1, 1, 2])
+        with cA:
+            if st.button("Alusta / joonista telg", use_container_width=True):
+                st.session_state["axis_xy_abs"] = []
+                st.session_state["axis_finished"] = False
+                st.rerun()
+        with cB:
+            if st.button("Undo (eemalda viimane)", use_container_width=True):
+                if st.session_state["axis_xy_abs"]:
+                    st.session_state["axis_xy_abs"] = st.session_state["axis_xy_abs"][:-1]
+                    st.session_state["axis_finished"] = False
+                    st.rerun()
+        with cC:
+            if st.button("Tühjenda telg", use_container_width=True):
+                st.session_state["axis_xy_abs"] = []
+                st.session_state["axis_finished"] = False
+                st.rerun()
+        with cD:
+            if st.button("Lõpeta telg", use_container_width=True):
+                if len(st.session_state["axis_xy_abs"]) < 2:
+                    st.warning("Telg peab olema vähemalt 2 punktiga.")
+                else:
+                    st.session_state["axis_finished"] = True
+                    st.success("Telg lõpetatud.")
+                    st.rerun()
+
+        axis_xy_abs = st.session_state["axis_xy_abs"]
+        finished = st.session_state["axis_finished"]
+        origin = st.session_state["origin_abs"]
+
+        # Local view for numeric stability
+        pts_local = _abs_to_local_xy(xyz_show_abs, origin)
+        axis_local = _axis_abs_to_local(axis_xy_abs, origin)
+
+        fig = _make_plotly_fig(pts_local, axis_local)
+
+        st.caption("👉 Klikk graafikul lisab telje punkti (SNAP: lähim TIN punkt). Zoom/pan Plotly toolbariga.")
+
+        # IMPORTANT: no config= here (your package version doesn't support it)
+        click_data = plotly_events(
+            fig,
+            click_event=True,
+            select_event=False,
+            hover_event=False,
+            override_height=650,
+            key="tin_plot_events_local",
+        )
+
+        if click_data and (not finished):
+            # click_data gives local x,y
+            lx = float(click_data[0]["x"])
+            ly = float(click_data[0]["y"])
+            ax, ay = _snap_local_click_to_nearest_abs((lx, ly), xyz_show_abs, origin)
+            st.session_state["axis_xy_abs"] = axis_xy_abs + [(ax, ay)]
+            st.rerun()
+
+        if axis_xy_abs:
+            L = polyline_length(axis_xy_abs)
+            st.write(f"**Telje pikkus:** {L:.2f} m  |  Punkte: {len(axis_xy_abs)}")
+
+        # Parameters
+        st.markdown("### Arvutusparameetrid")
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            pk_step = st.number_input("PK samm (m)", min_value=0.1, value=1.0, step=0.1)
+            cross_len = st.number_input("Ristlõike kogupikkus (m)", min_value=2.0, value=25.0, step=1.0)
+            sample_step = st.number_input("Proovipunkti samm (m)", min_value=0.02, value=0.1, step=0.01)
+        with c2:
+            tol = st.number_input("Tasase tolerants (m)", min_value=0.001, value=0.05, step=0.005)
+            min_run = st.number_input("Min tasane lõik (m)", min_value=0.05, value=0.2, step=0.05)
+            min_depth = st.number_input("Min kõrgus põhjast (m)", min_value=0.0, value=0.3, step=0.05)
+        with c3:
+            slope = st.text_input("Nõlva kalle (nt 1:2)", value="1:2")
+            bottom_w = st.number_input("Põhja laius b (m)", min_value=0.0, value=0.40, step=0.05)
+
+        if st.button("Arvuta PK tabel (telje järgi)", use_container_width=True):
+            if len(axis_xy_abs) < 2:
+                st.warning("Joonista telg enne arvutamist (vähemalt 2 punkti).")
+            else:
+                res = compute_pk_table_from_landxml(
+                    xml_bytes=xml_bytes,
+                    axis_xy=axis_xy_abs,
+                    pk_step=float(pk_step),
+                    cross_len=float(cross_len),
+                    sample_step=float(sample_step),
+                    tol=float(tol),
+                    min_run=float(min_run),
+                    min_depth_from_bottom=float(min_depth),
+                    slope_text=slope,
+                    bottom_w=float(bottom_w),
+                )
+
+                df = pd.DataFrame(res["rows"])
+                st.success(f"✅ Kokku maht: {res['total_volume_m3']:.3f} m³")
+                st.write(f"Telje pikkus: **{res['axis_length_m']:.2f} m** | PK-sid: **{res['count']}**")
+
+                planned_area = None
+                if res["axis_length_m"] > 0 and res["total_volume_m3"] is not None:
+                    planned_area = float(res["total_volume_m3"] / res["axis_length_m"])
+
+                key = st.session_state.get("landxml_key") or (p.get("landxml_key") or "")
+                set_project_landxml(
+                    p["id"],
+                    landxml_key=key,
+                    planned_volume_m3=float(res["total_volume_m3"]),
+                    planned_length_m=float(res["axis_length_m"]),
+                    planned_area_m2=planned_area,
+                )
+
+                st.dataframe(df, use_container_width=True)
+
+                csv = df.to_csv(index=False, sep=";").encode("utf-8")
+                st.download_button(
+                    "⬇️ Lae alla CSV",
+                    data=csv,
+                    file_name=f"{p['name']}_pk_tabel.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+
+                st.info("Tulemused salvestati projekti planned_* väljade alla (DB).")
+
+        p2 = get_project(pid)
+        if p2 and p2.get("planned_volume_m3") is not None:
+            st.markdown("### Projekti salvestatud planeeritud väärtused")
+            st.write(f"**Planned length:** {float(p2['planned_length_m'] or 0):.2f} m")
+            st.write(f"**Planned area:** {float(p2['planned_area_m2'] or 0):.3f} m²")
+            st.write(f"**Planned volume:** {float(p2['planned_volume_m3'] or 0):.3f} m³")
+
+        st.markdown("</div>", unsafe_allow_html=True)
 
         # ---------------- R2 file upload ----------------
         st.markdown('<div class="block">', unsafe_allow_html=True)
