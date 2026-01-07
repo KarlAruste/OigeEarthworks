@@ -45,6 +45,31 @@ def _downsample_points(xyz: np.ndarray, max_pts: int = 60000) -> np.ndarray:
     return xyz[idx]
 
 
+def _ensure_xy_is_EN(xyz: np.ndarray) -> np.ndarray:
+    """
+    Your coords example:
+      N=6_568_466 (big), E=609_910 (small), Z=...
+    We want X=E (small), Y=N (big).
+
+    If median X looks like Northing (~millions) and median Y looks like Easting (~hundreds of thousands),
+    swap first two columns.
+    """
+    if xyz is None or xyz.size == 0:
+        return xyz
+
+    x_med = float(np.nanmedian(xyz[:, 0]))
+    y_med = float(np.nanmedian(xyz[:, 1]))
+
+    # heuristic: Northing usually > 2,000,000; Easting usually < 2,000,000 (in many projected systems incl. Estonia)
+    if x_med > 2_000_000 and y_med < 2_000_000:
+        # xyz currently (N,E,Z) -> convert to (E,N,Z)
+        xyz2 = xyz.copy()
+        xyz2[:, 0], xyz2[:, 1] = xyz[:, 1], xyz[:, 0]
+        return xyz2
+
+    return xyz
+
+
 def _origin_abs(xyz_abs: np.ndarray) -> tuple[float, float]:
     # origin = mean to keep local coords centered
     x0 = float(np.nanmean(xyz_abs[:, 0]))
@@ -109,15 +134,29 @@ def _make_plotly_fig(local_pts_xy: np.ndarray, axis_local_xy: list[tuple[float, 
     x = local_pts_xy[:, 0]
     y = local_pts_xy[:, 1]
 
-    # show points
+    # 1) visible points
     fig.add_trace(
         go.Scattergl(
             x=x,
             y=y,
             mode="markers",
-            marker=dict(size=4, opacity=0.7),
+            marker=dict(size=4, opacity=0.75),
             name="TIN punktid",
             hoverinfo="skip",
+        )
+    )
+
+    # 2) big almost-invisible click-catcher layer (so click works even if not pixel-perfect)
+    #    NOTE: opacity must be >0 to receive click events reliably.
+    fig.add_trace(
+        go.Scattergl(
+            x=x,
+            y=y,
+            mode="markers",
+            marker=dict(size=18, opacity=0.01),
+            name="click_layer",
+            hoverinfo="skip",
+            showlegend=False,
         )
     )
 
@@ -136,9 +175,8 @@ def _make_plotly_fig(local_pts_xy: np.ndarray, axis_local_xy: list[tuple[float, 
             )
         )
 
-    # bounds / padding
-    xmin, xmax = float(np.min(x)), float(np.max(x))
-    ymin, ymax = float(np.min(y)), float(np.max(y))
+    xmin, xmax = float(np.nanmin(x)), float(np.nanmax(x))
+    ymin, ymax = float(np.nanmin(y)), float(np.nanmax(y))
     dx = (xmax - xmin) if xmax > xmin else 1.0
     dy = (ymax - ymin) if ymax > ymin else 1.0
     pad_x = dx * 0.08
@@ -153,6 +191,7 @@ def _make_plotly_fig(local_pts_xy: np.ndarray, axis_local_xy: list[tuple[float, 
         clickmode="event+select",
         legend=dict(orientation="h"),
     )
+
     fig.update_xaxes(title="E (local, m)", range=[xmin - pad_x, xmax + pad_x])
     fig.update_yaxes(title="N (local, m)", range=[ymin - pad_y, ymax + pad_y], scaleanchor="x", scaleratio=1)
 
@@ -169,7 +208,6 @@ def render_projects_view():
     s3 = get_s3()
     projects = list_projects()
 
-    # session defaults
     st.session_state.setdefault("active_project_id", None)
     st.session_state.setdefault("axis_xy_abs", [])        # [(E,N)] ABS
     st.session_state.setdefault("axis_finished", False)
@@ -272,7 +310,13 @@ def render_projects_view():
         # Read points
         try:
             pts_dict, _faces = read_landxml_tin_from_bytes(xml_bytes)
-            xyz_abs = np.array(list(pts_dict.values()), dtype=float)  # expects (E,N,Z) already handled in landxml.py
+
+            xyz_raw = np.array(list(pts_dict.values()), dtype=float)
+            xyz_raw = xyz_raw[np.isfinite(xyz_raw).all(axis=1)]
+
+            # Ensure (E,N,Z)
+            xyz_abs = _ensure_xy_is_EN(xyz_raw)
+
             xyz_show_abs = _downsample_points(xyz_abs, max_pts=60000)
             st.session_state["xyz_show_abs"] = xyz_show_abs
 
@@ -281,7 +325,8 @@ def render_projects_view():
 
             x_min = float(np.nanmin(xyz_show_abs[:, 0])); x_max = float(np.nanmax(xyz_show_abs[:, 0]))
             y_min = float(np.nanmin(xyz_show_abs[:, 1])); y_max = float(np.nanmax(xyz_show_abs[:, 1]))
-            st.caption(f"ABS X min/max: {x_min:.3f} / {x_max:.3f} | ABS Y min/max: {y_min:.3f} / {y_max:.3f}")
+            st.caption(f"ABS X(E) min/max: {x_min:.3f} / {x_max:.3f} | ABS Y(N) min/max: {y_min:.3f} / {y_max:.3f}")
+            st.caption(f"Punkte kokku: {xyz_raw.shape[0]} | Näitan: {xyz_show_abs.shape[0]}")
 
         except Exception as e:
             st.error(f"LandXML lugemine ebaõnnestus: {e}")
@@ -319,15 +364,16 @@ def render_projects_view():
         finished = st.session_state["axis_finished"]
         origin = st.session_state["origin_abs"]
 
-        # Local view for numeric stability
+        # Local view for stability
         pts_local = _abs_to_local_xy(xyz_show_abs, origin)
         axis_local = _axis_abs_to_local(axis_xy_abs, origin)
 
         fig = _make_plotly_fig(pts_local, axis_local)
 
-        st.caption("👉 Klikk graafikul lisab telje punkti (SNAP: lähim TIN punkt). Zoom/pan Plotly toolbariga.")
+        st.caption("👉 Kliki punktide/joone lähedale — lisab teljele LÄHIMA TIN punkti (snap). (Pan: lohista)")
 
-        # IMPORTANT: no config= here (your package version doesn't support it)
+        # plotly_events: click event only fires when clicking a trace.
+        # We added 'click_layer' with big nearly transparent markers to catch clicks.
         click_data = plotly_events(
             fig,
             click_event=True,
@@ -337,8 +383,10 @@ def render_projects_view():
             key="tin_plot_events_local",
         )
 
+        # Debug line (shows if click is received)
+        st.write(f"Klikke saadud: {len(click_data) if click_data else 0}")
+
         if click_data and (not finished):
-            # click_data gives local x,y
             lx = float(click_data[0]["x"])
             ly = float(click_data[0]["y"])
             ax, ay = _snap_local_click_to_nearest_abs((lx, ly), xyz_show_abs, origin)
@@ -371,7 +419,7 @@ def render_projects_view():
             else:
                 res = compute_pk_table_from_landxml(
                     xml_bytes=xml_bytes,
-                    axis_xy=axis_xy_abs,
+                    axis_xy=axis_xy_abs,  # ABS (E,N)
                     pk_step=float(pk_step),
                     cross_len=float(cross_len),
                     sample_step=float(sample_step),
