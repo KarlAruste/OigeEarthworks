@@ -253,7 +253,10 @@ def render_projects_view():
 
         st.caption("👉 Klikk ükskõik kuhu (ka tühjale alale) — lisame teljele **lähima TIN punkti** (snap).")
 
-        fig = _make_fig(xy_local_show, axis_local)
+        # uirev: sõltub LandXML key-st (või originist) => uus fail resetib vaate
+uirev = f"tin_{st.session_state.get('landxml_key','')}_{E0:.3f}_{N0:.3f}"
+
+fig = _make_fig(xy_local_show, axis_local, uirev=uirev)
 
         # IMPORTANT: streamlit-plotly-events==0.0.6 -> NO config= argument!
         click_data = plotly_events(
