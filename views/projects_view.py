@@ -28,6 +28,8 @@ from streamlit_plotly_events import plotly_events
 
 
 def _downsample(xy: np.ndarray, max_pts: int = 60000) -> np.ndarray:
+    if xy is None or xy.size == 0:
+        return xy
     if xy.shape[0] <= max_pts:
         return xy
     idx = np.random.choice(xy.shape[0], size=max_pts, replace=False)
@@ -45,7 +47,6 @@ def _make_fig(points_local: np.ndarray, axis_local: list, uirev: str):
         )
         return fig
 
-    # ---- FORCE RANGE (see fixib “0...0” / tühi vaade) ----
     xmin = float(np.min(points_local[:, 0]))
     xmax = float(np.max(points_local[:, 0]))
     ymin = float(np.min(points_local[:, 1]))
@@ -56,25 +57,30 @@ def _make_fig(points_local: np.ndarray, axis_local: list, uirev: str):
     pad_x = dx * 0.08
     pad_y = dy * 0.08
 
-    fig.add_trace(go.Scattergl(
-        x=points_local[:, 0].astype(float),
-        y=points_local[:, 1].astype(float),
-        mode="markers",
-        marker=dict(size=4, opacity=0.75),
-        name="TIN punktid",
-        hoverinfo="skip",
-    ))
+    fig.add_trace(
+        go.Scattergl(
+            x=points_local[:, 0].astype(float),
+            y=points_local[:, 1].astype(float),
+            mode="markers",
+            marker=dict(size=4, opacity=0.75),
+            name="TIN punktid",
+            hoverinfo="skip",
+        )
+    )
 
     if axis_local and len(axis_local) >= 1:
         xs = [p[0] for p in axis_local]
         ys = [p[1] for p in axis_local]
-        fig.add_trace(go.Scatter(
-            x=xs, y=ys,
-            mode="lines+markers",
-            line=dict(width=4),
-            marker=dict(size=10),
-            name="Telg"
-        ))
+        fig.add_trace(
+            go.Scatter(
+                x=xs,
+                y=ys,
+                mode="lines+markers",
+                line=dict(width=4),
+                marker=dict(size=10),
+                name="Telg",
+            )
+        )
 
     fig.update_layout(
         height=650,
@@ -82,16 +88,23 @@ def _make_fig(points_local: np.ndarray, axis_local: list, uirev: str):
         margin=dict(l=10, r=10, t=40, b=10),
         dragmode="pan",
         legend=dict(orientation="h"),
-        # uirevision peab muutuma, kui uus mudel laetakse (siis range resetib)
         uirevision=uirev,
     )
 
-    fig.update_xaxes(title="E (local, m)", range=[xmin - pad_x, xmax + pad_x], tickformat=".0f")
-    fig.update_yaxes(title="N (local, m)", range=[ymin - pad_y, ymax + pad_y], tickformat=".0f",
-                     scaleanchor="x", scaleratio=1)
+    fig.update_xaxes(
+        title="E (local, m)",
+        range=[xmin - pad_x, xmax + pad_x],
+        tickformat=".0f",
+    )
+    fig.update_yaxes(
+        title="N (local, m)",
+        range=[ymin - pad_y, ymax + pad_y],
+        tickformat=".0f",
+        scaleanchor="x",
+        scaleratio=1,
+    )
 
     return fig
-
 
 
 def render_projects_view():
@@ -99,21 +112,23 @@ def render_projects_view():
     s3 = get_s3()
     projects = list_projects()
 
-    # session state
+    # ---------------- session state ----------------
     st.session_state.setdefault("active_project_id", None)
 
     st.session_state.setdefault("landxml_bytes", None)
     st.session_state.setdefault("landxml_key", None)
 
-    # TIN cached in session
-    st.session_state.setdefault("tin_pts", None)     # dict id->(E,N,Z)
+    st.session_state.setdefault("tin_pts", None)      # dict id->(E,N,Z)
     st.session_state.setdefault("tin_faces", None)
-    st.session_state.setdefault("tin_index", None)   # TinIndex
-    st.session_state.setdefault("origin_EN", None)   # (E0,N0) for local view
+    st.session_state.setdefault("tin_index", None)    # TinIndex
+    st.session_state.setdefault("origin_EN", None)    # (E0,N0)
 
-    # axis saved in ABS coords (E,N)
+    # axis ABS (E,N)
     st.session_state.setdefault("axis_abs", [])
     st.session_state.setdefault("axis_finished", False)
+
+    # uirevision key for plot (reset on new model)
+    st.session_state.setdefault("plot_uirev", "init")
 
     # ---------------- Create project ----------------
     st.subheader("➕ Loo projekt")
@@ -143,12 +158,14 @@ def render_projects_view():
         return
 
     left, right = st.columns([1, 3], gap="large")
+
     with left:
         st.caption("Vali projekt:")
         for proj in projects:
             if st.button(proj["name"], use_container_width=True, key=f"projbtn_{proj['id']}"):
                 st.session_state["active_project_id"] = proj["id"]
-                # reset model/axis when switching
+
+                # reset when switching
                 st.session_state["landxml_bytes"] = None
                 st.session_state["landxml_key"] = None
                 st.session_state["tin_pts"] = None
@@ -157,6 +174,7 @@ def render_projects_view():
                 st.session_state["origin_EN"] = None
                 st.session_state["axis_abs"] = []
                 st.session_state["axis_finished"] = False
+                st.session_state["plot_uirev"] = f"init-{proj['id']}"
                 st.rerun()
 
     with right:
@@ -175,14 +193,17 @@ def render_projects_view():
 
         # ---------------- LandXML upload ----------------
         st.markdown("### 📄 LandXML")
-        landxml = st.file_uploader("Laadi üles LandXML (.xml/.landxml)", type=["xml", "landxml"], key="landxml_upload")
+        landxml = st.file_uploader(
+            "Laadi üles LandXML (.xml/.landxml)",
+            type=["xml", "landxml"],
+            key="landxml_upload",
+        )
 
         if landxml and st.button("Salvesta LandXML (R2) & lae mudel", use_container_width=True):
             prefix = project_prefix(p["name"]) + "landxml/"
             key = upload_file(s3, prefix, landxml)
             xml_bytes = download_bytes(s3, key)
 
-            # parse tin
             pts, faces = read_landxml_tin_from_bytes(xml_bytes)
             idx = build_tin_index(pts, faces)
 
@@ -200,6 +221,9 @@ def render_projects_view():
             st.session_state["axis_abs"] = []
             st.session_state["axis_finished"] = False
 
+            # change uirevision -> plot range resets
+            st.session_state["plot_uirev"] = f"model-{pid}-{key}"
+
             st.success(f"LandXML laetud. Punkte: {len(pts):,} | Faces: {len(faces):,}")
             st.rerun()
 
@@ -214,7 +238,6 @@ def render_projects_view():
         xy_local = np.column_stack([xyz[:, 0] - E0, xyz[:, 1] - N0])
         xy_local_show = _downsample(xy_local, max_pts=60000)
 
-        # Axis local for plotting
         axis_abs = st.session_state["axis_abs"]
         axis_local = [(E - E0, N - N0) for (E, N) in axis_abs]
 
@@ -251,32 +274,40 @@ def render_projects_view():
                     st.success("Telg lõpetatud.")
                     st.rerun()
 
-        st.caption("👉 Klikk graafikul lisab telje punkti. Zoom: hiirerullik. Pan: lohista.")
+        st.caption("👉 Klikk graafikul lisab telje punkti (snapib lähimale TIN punktile). Pan: lohista.")
 
-# NB! streamlit-plotly-events ei toeta kõigis versioonides config=... parameetrit.
-# Seepärast paneme scrollZoom otse fig layouti sisse.
-fig.update_layout(
-    dragmode="pan",
-)
+        # ---------------- Plot + click capture ----------------
+        fig = _make_fig(
+            points_local=xy_local_show,
+            axis_local=axis_local,
+            uirev=st.session_state["plot_uirev"],
+        )
 
-click_data = plotly_events(
-    fig,
-    click_event=True,
-    select_event=False,
-    hover_event=False,
-    override_height=650,
-    key="tin_plot_events",
-)
+        click_data = plotly_events(
+            fig,
+            click_event=True,
+            select_event=False,
+            hover_event=False,
+            override_height=650,
+            key="tin_plot_events",
+        )
 
-# ⬇⬇⬇ SAMA INDENT ⬇⬇⬇
-if st.session_state["axis_abs"]:
-    if click_data:
-        x = float(click_data[0]["x"])
-        y = float(click_data[0]["y"])
-        st.session_state["axis_xy"].append((x, y))
-        st.rerun()
+        # ---- ADD POINT ON CLICK (IMPORTANT: allow first point!) ----
+        if click_data and (not st.session_state["axis_finished"]):
+            x_local = float(click_data[0]["x"])
+            y_local = float(click_data[0]["y"])
 
+            # local -> ABS
+            E_click = x_local + E0
+            N_click = y_local + N0
 
+            # snap to nearest TIN point
+            E_snap, N_snap, _z = snap_xy_to_tin(idx, E_click, N_click)
+
+            st.session_state["axis_abs"] = st.session_state["axis_abs"] + [(float(E_snap), float(N_snap))]
+            st.rerun()
+
+        # show axis stats
         if st.session_state["axis_abs"]:
             L = polyline_length(st.session_state["axis_abs"])
             st.write(f"**Telje pikkus:** {L:.2f} m | Punkte: {len(st.session_state['axis_abs'])}")
@@ -302,7 +333,7 @@ if st.session_state["axis_abs"]:
             else:
                 res = compute_pk_table_from_landxml(
                     xml_bytes=st.session_state["landxml_bytes"],
-                    axis_xy_abs=st.session_state["axis_abs"],   # ABS!
+                    axis_xy_abs=st.session_state["axis_abs"],  # ABS!
                     pk_step=float(pk_step),
                     cross_len=float(cross_len),
                     sample_step=float(sample_step),
@@ -318,7 +349,7 @@ if st.session_state["axis_abs"]:
                 st.write(f"Telje pikkus: **{res['axis_length_m']:.2f} m** | PK-sid: **{res['count']}**")
 
                 planned_area = None
-                if res["axis_length_m"] > 0 and res["total_volume_m3"] is not None:
+                if res["axis_length_m"] and res["axis_length_m"] > 0 and res["total_volume_m3"] is not None:
                     planned_area = float(res["total_volume_m3"] / res["axis_length_m"])
 
                 key = st.session_state["landxml_key"] or p.get("landxml_key") or ""
@@ -337,7 +368,7 @@ if st.session_state["axis_abs"]:
                     data=csv,
                     file_name=f"{p['name']}_pk_tabel.csv",
                     mime="text/csv",
-                    use_container_width=True
+                    use_container_width=True,
                 )
 
         st.divider()
