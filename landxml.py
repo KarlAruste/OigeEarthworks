@@ -46,41 +46,31 @@ def _maybe_swap_to_EN(a: float, b: float) -> Tuple[float, float]:
 # ============================================================
 # LandXML TIN read (bytes)
 # ============================================================
-def read_landxml_tin_from_bytes(xml_bytes: bytes) -> Tuple[Dict[int, Tuple[float, float, float]], List[Tuple[int, int, int]]]:
-    """
-    Toetab:
-      A) <Definition><Pnts><P id="..">N E Z</P> ja <Faces><F>a b c</F>
-      B) fallback <PntList3D> ... </PntList3D> (ainult punktid; faces puuduvad)
+def read_landxml_tin_from_bytes(xml_bytes: bytes):
+    import xml.etree.ElementTree as ET
+    import numpy as np
 
-    Tagastab:
-      pts: dict[int] -> (E, N, Z)
-      faces: list[(a,b,c)]  (võib olla tühi kui faces ei leita)
-    """
     root = ET.fromstring(xml_bytes)
 
-    pts: Dict[int, Tuple[float, float, float]] = {}
-    faces: List[Tuple[int, int, int]] = []
+    raw = []  # (pid, a, b, z)
+    faces = []
 
-    # ---- 1) Leia <P id=".."> ----
+    # 1) P id=".."
     for el in root.iter():
         if _strip(el.tag).lower() == "p":
             pid = el.attrib.get("id")
             txt = (el.text or "").strip()
             if not pid or not txt:
                 continue
-            arr = _as_floats(txt)
-            if len(arr) < 3:
+            parts = _as_floats(txt)
+            if len(parts) < 3:
                 continue
-
-            a, b, z = float(arr[0]), float(arr[1]), float(arr[2])
-            e, n = _maybe_swap_to_EN(a, b)
             try:
-                pts[int(pid)] = (float(e), float(n), float(z))
+                raw.append((int(pid), float(parts[0]), float(parts[1]), float(parts[2])))
             except Exception:
-                # kui id pole int
-                continue
+                pass
 
-    # ---- 2) Leia <F> faces ----
+    # 2) Faces
     for el in root.iter():
         if _strip(el.tag).lower() == "f":
             txt = (el.text or "").strip()
@@ -89,13 +79,12 @@ def read_landxml_tin_from_bytes(xml_bytes: bytes) -> Tuple[Dict[int, Tuple[float
             arr = txt.replace(",", " ").split()
             if len(arr) >= 3:
                 try:
-                    a, b, c = int(arr[0]), int(arr[1]), int(arr[2])
-                    faces.append((a, b, c))
+                    faces.append((int(arr[0]), int(arr[1]), int(arr[2])))
                 except Exception:
                     pass
 
-    # ---- 3) Fallback: <PntList3D> (kui P id ei leitud) ----
-    if not pts:
+    # 3) Fallback PntList3D (kui P id ei olnud)
+    if not raw:
         for el in root.iter():
             if _strip(el.tag).lower() == "pntlist3d":
                 txt = (el.text or "").strip()
@@ -105,11 +94,29 @@ def read_landxml_tin_from_bytes(xml_bytes: bytes) -> Tuple[Dict[int, Tuple[float
                 if len(arr) >= 3:
                     pid = 1
                     for i in range(0, len(arr) - 2, 3):
-                        a, b, z = float(arr[i]), float(arr[i + 1]), float(arr[i + 2])
-                        e, n = _maybe_swap_to_EN(a, b)
-                        pts[pid] = (float(e), float(n), float(z))
+                        raw.append((pid, float(arr[i]), float(arr[i + 1]), float(arr[i + 2])))
                         pid += 1
                 break
+
+    if not raw:
+        return {}, []
+
+    # --- OTSUSTA GLOBAALSELT kas (a,b) on (N,E) või (E,N)
+    A = np.array([r[1] for r in raw], dtype=float)
+    B = np.array([r[2] for r in raw], dtype=float)
+    a_med = float(np.median(A))
+    b_med = float(np.median(B))
+
+    # Eestis tüüpiline: N ~ 6.5M, E ~ 0.6M
+    swap_all = (a_med > 2_000_000 and b_med < 2_000_000)
+
+    pts = {}
+    for pid, a, b, z in raw:
+        if swap_all:
+            e, n = b, a
+        else:
+            e, n = a, b
+        pts[pid] = (float(e), float(n), float(z))
 
     return pts, faces
 
