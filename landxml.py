@@ -1,12 +1,4 @@
 # landxml.py
-# ------------------------------------------------------------
-# LandXML (TIN) lugemine + PK tabeli arvutus (telje järgi)
-# Eesmärk: sobib Streamlit projektiga (views/projects_view.py)
-# - Loeb LandXML-ist TIN punktid + faces (kui olemas)
-# - Koordinaadid normaliseeritakse vormi (E, N, Z)
-# - Pakub polyline_length + compute_pk_table_from_landxml
-# ------------------------------------------------------------
-
 from __future__ import annotations
 
 import math
@@ -18,7 +10,7 @@ import numpy as np
 
 
 # ============================================================
-# Helpers
+# XML helpers
 # ============================================================
 def _strip(tag: str) -> str:
     return tag.split("}")[-1] if "}" in tag else tag
@@ -28,145 +20,121 @@ def _as_floats(text: str) -> List[float]:
     return [float(x) for x in text.replace(",", " ").split() if x.strip()]
 
 
-def _maybe_swap_to_EN(a: float, b: float) -> Tuple[float, float]:
-    """
-    LandXML-ist võib tulla kas (E,N) või (N,E).
-    Eestis (L-EST97) tüüpiline:
-      N ~ 6,5 miljonit
-      E ~ 0,5..0,7 miljonit
-
-    Kui a on "miljonites" ja b "sadatuhandetes", siis a=N ja b=E → swap.
-    Tagastame alati (E, N).
-    """
-    if a > 2_000_000 and b < 2_000_000:
-        return b, a
-    return a, b
-
-
 # ============================================================
-# LandXML TIN read (bytes)
+# LandXML read: points + faces
+# - Supports <Pnts><P id=".."> ... </P> and <Faces><F>...</F>
+# - Also supports fallback <PntList3D> ... </PntList3D>
+# - ALWAYS returns points in (E,N,Z)
 # ============================================================
-def read_landxml_tin_from_bytes(xml_bytes: bytes):
-    import xml.etree.ElementTree as ET
-    import numpy as np
-
+def read_landxml_tin_from_bytes(xml_bytes: bytes) -> Tuple[Dict[int, Tuple[float, float, float]], List[Tuple[int, int, int]]]:
     root = ET.fromstring(xml_bytes)
 
-    raw = []  # (pid, a, b, z)
-    faces = []
+    raw: List[Tuple[int, float, float, float]] = []  # (pid, a, b, z) where a/b are first two numbers as-is
+    faces: List[Tuple[int, int, int]] = []
 
-    # 1) P id=".."
+    # --- 1) Preferred: <P id="..">a b z</P>
     for el in root.iter():
         if _strip(el.tag).lower() == "p":
             pid = el.attrib.get("id")
             txt = (el.text or "").strip()
             if not pid or not txt:
                 continue
-            parts = _as_floats(txt)
-            if len(parts) < 3:
+            vals = _as_floats(txt)
+            if len(vals) < 3:
                 continue
             try:
-                raw.append((int(pid), float(parts[0]), float(parts[1]), float(parts[2])))
+                raw.append((int(pid), float(vals[0]), float(vals[1]), float(vals[2])))
             except Exception:
                 pass
 
-    # 2) Faces
+    # --- 2) Faces <F>a b c</F> (optional)
     for el in root.iter():
         if _strip(el.tag).lower() == "f":
             txt = (el.text or "").strip()
             if not txt:
                 continue
-            arr = txt.replace(",", " ").split()
-            if len(arr) >= 3:
+            parts = txt.replace(",", " ").split()
+            if len(parts) >= 3:
                 try:
-                    faces.append((int(arr[0]), int(arr[1]), int(arr[2])))
+                    faces.append((int(parts[0]), int(parts[1]), int(parts[2])))
                 except Exception:
                     pass
 
-    # 3) Fallback PntList3D (kui P id ei olnud)
+    # --- 3) Fallback: <PntList3D> a b z a b z ... </PntList3D>
     if not raw:
         for el in root.iter():
             if _strip(el.tag).lower() == "pntlist3d":
                 txt = (el.text or "").strip()
                 if not txt:
                     continue
-                arr = _as_floats(txt)
-                if len(arr) >= 3:
+                vals = _as_floats(txt)
+                if len(vals) >= 3:
                     pid = 1
-                    for i in range(0, len(arr) - 2, 3):
-                        raw.append((pid, float(arr[i]), float(arr[i + 1]), float(arr[i + 2])))
+                    for i in range(0, len(vals) - 2, 3):
+                        raw.append((pid, float(vals[i]), float(vals[i + 1]), float(vals[i + 2])))
                         pid += 1
                 break
 
     if not raw:
         return {}, []
 
-    # --- OTSUSTA GLOBAALSELT kas (a,b) on (N,E) või (E,N)
+    # --- Global decision: are coordinates (N,E) or (E,N)?
     A = np.array([r[1] for r in raw], dtype=float)
     B = np.array([r[2] for r in raw], dtype=float)
     a_med = float(np.median(A))
     b_med = float(np.median(B))
 
-    # Eestis tüüpiline: N ~ 6.5M, E ~ 0.6M
+    # Typical Estonia: N ~ 6.5M, E ~ 0.6M → if first is huge and second smaller → swap
     swap_all = (a_med > 2_000_000 and b_med < 2_000_000)
 
-    pts = {}
+    pts: Dict[int, Tuple[float, float, float]] = {}
     for pid, a, b, z in raw:
         if swap_all:
             e, n = b, a
         else:
             e, n = a, b
-        pts[pid] = (float(e), float(n), float(z))
+        pts[int(pid)] = (float(e), float(n), float(z))
 
     return pts, faces
 
 
 # ============================================================
-# TIN index + Z interpolation
+# Local coordinate utilities (plotting)
 # ============================================================
-def _point_in_tri_2d(px, py, ax, ay, bx, by, cx, cy) -> bool:
-    def s(x1, y1, x2, y2, x3, y3):
-        return (x1 - x3) * (y2 - y3) - (x2 - x3) * (y1 - y3)
-
-    b1 = s(px, py, ax, ay, bx, by) < 0.0
-    b2 = s(px, py, bx, by, cx, cy) < 0.0
-    b3 = s(px, py, cx, cy, ax, ay) < 0.0
-    return (b1 == b2) and (b2 == b3)
-
-
-def _interp_z_from_plane(px, py, A, B, C) -> Optional[float]:
-    ax, ay, az = A
-    bx, by, bz = B
-    cx, cy, cz = C
-
-    ux, uy, uz = bx - ax, by - ay, bz - az
-    vx, vy, vz = cx - ax, cy - ay, cz - az
-    nx = uy * vz - uz * vy
-    ny = uz * vx - ux * vz
-    nz = ux * vy - uy * vx
-    if abs(nz) < 1e-12:
-        return None
-    return float(az - (nx * (px - ax) + ny * (py - ay)) / nz)
+def compute_local_origin_EN(xyz_ENZ: np.ndarray) -> Tuple[float, float]:
+    """
+    xyz_ENZ: Nx3 array [E,N,Z]
+    Use median as stable origin.
+    """
+    E0 = float(np.median(xyz_ENZ[:, 0]))
+    N0 = float(np.median(xyz_ENZ[:, 1]))
+    return E0, N0
 
 
+def to_local_EN(E: float, N: float, E0: float, N0: float) -> Tuple[float, float]:
+    return float(E - E0), float(N - N0)
+
+
+def to_abs_EN(x: float, y: float, E0: float, N0: float) -> Tuple[float, float]:
+    return float(x + E0), float(y + N0)
+
+
+# ============================================================
+# Fast spatial index for nearest point and triangle lookup
+# ============================================================
 @dataclass
 class TinIndex:
-    tris: np.ndarray          # (T, 3, 3) => (E,N,Z)
-    minx: float               # E min
-    miny: float               # N min
+    tris: np.ndarray                 # (T,3,3) float, each vertex (E,N,Z)
+    minx: float
+    miny: float
     cell: float
-    tri_buckets: dict         # (ix,iy)->[tri_ids]
-    pt_buckets: dict          # (ix,iy)->[(E,N,Z),...]
+    tri_buckets: dict                # (ix,iy)->[tri_idx,...]
+    pt_buckets: dict                 # (ix,iy)->[(E,N,Z),...]
 
 
-def _build_tin_index(pts: Dict[int, Tuple[float, float, float]],
-                     faces: List[Tuple[int, int, int]],
-                     target_bucket_count: int = 150_000) -> TinIndex:
-    """
-    Ehita ruumiline indeks kiireks z_at_xy päringuks.
-    Kui faces puuduvad, siis tri_buckets jääb sisuliselt tühjaks ja
-    z leitakse lähima punkti järgi.
-    """
+def build_tin_index(pts: Dict[int, Tuple[float, float, float]],
+                    faces: List[Tuple[int, int, int]],
+                    target_bucket_count: int = 150_000) -> TinIndex:
     if faces:
         tris = np.empty((len(faces), 3, 3), dtype=float)
         for i, (a, b, c) in enumerate(faces):
@@ -178,7 +146,6 @@ def _build_tin_index(pts: Dict[int, Tuple[float, float, float]],
         minx, maxx = float(xs.min()), float(xs.max())
         miny, maxy = float(ys.min()), float(ys.max())
     else:
-        # fallback: ainult punktid
         arr = np.array(list(pts.values()), dtype=float)
         tris = np.empty((0, 3, 3), dtype=float)
         minx, maxx = float(arr[:, 0].min()), float(arr[:, 0].max())
@@ -209,12 +176,12 @@ def _build_tin_index(pts: Dict[int, Tuple[float, float, float]],
     return TinIndex(tris=tris, minx=minx, miny=miny, cell=cell, tri_buckets=tri_buckets, pt_buckets=pt_buckets)
 
 
-def _nearest_point_z(idx: TinIndex, px: float, py: float, max_rings: int = 6) -> Optional[float]:
+def nearest_point_xyz(idx: TinIndex, px: float, py: float, max_rings: int = 10) -> Optional[Tuple[float, float, float]]:
     ix = int((px - idx.minx) // idx.cell)
     iy = int((py - idx.miny) // idx.cell)
 
     best_d2 = None
-    best_z = None
+    best = None
 
     for r in range(0, max_rings + 1):
         found_any = False
@@ -230,15 +197,42 @@ def _nearest_point_z(idx: TinIndex, px: float, py: float, max_rings: int = 6) ->
                     d2 = (x - px) ** 2 + (y - py) ** 2
                     if best_d2 is None or d2 < best_d2:
                         best_d2 = d2
-                        best_z = z
-        if found_any and best_z is not None:
-            return float(best_z)
-
+                        best = (x, y, z)
+        if found_any and best is not None:
+            return best
     return None
 
 
-def _z_at_xy(idx: TinIndex, px: float, py: float) -> Optional[float]:
-    # kui on faces, proovi kõigepealt trianglitega
+# ============================================================
+# Z at XY (triangulation if available, else nearest point)
+# ============================================================
+def _point_in_tri_2d(px, py, ax, ay, bx, by, cx, cy) -> bool:
+    def s(x1, y1, x2, y2, x3, y3):
+        return (x1 - x3) * (y2 - y3) - (x2 - x3) * (y1 - y3)
+
+    b1 = s(px, py, ax, ay, bx, by) < 0.0
+    b2 = s(px, py, bx, by, cx, cy) < 0.0
+    b3 = s(px, py, cx, cy, ax, ay) < 0.0
+    return (b1 == b2) and (b2 == b3)
+
+
+def _interp_z(px, py, A, B, C) -> Optional[float]:
+    ax, ay, az = A
+    bx, by, bz = B
+    cx, cy, cz = C
+
+    ux, uy, uz = bx - ax, by - ay, bz - az
+    vx, vy, vz = cx - ax, cy - ay, cz - az
+    nx = uy * vz - uz * vy
+    ny = uz * vx - ux * vz
+    nz = ux * vy - uy * vx
+    if abs(nz) < 1e-12:
+        return None
+    return float(az - (nx * (px - ax) + ny * (py - ay)) / nz)
+
+
+def z_at_xy(idx: TinIndex, px: float, py: float) -> Optional[float]:
+    # try triangles first
     if idx.tris.shape[0] > 0:
         ix = int((px - idx.minx) // idx.cell)
         iy = int((py - idx.miny) // idx.cell)
@@ -251,38 +245,36 @@ def _z_at_xy(idx: TinIndex, px: float, py: float) -> Optional[float]:
         for ti in candidates:
             A, B, C = idx.tris[ti]
             if _point_in_tri_2d(px, py, A[0], A[1], B[0], B[1], C[0], C[1]):
-                z = _interp_z_from_plane(px, py, A, B, C)
+                z = _interp_z(px, py, A, B, C)
                 if z is not None:
                     return float(z)
 
-    # fallback: nearest point
-    return _nearest_point_z(idx, px, py, max_rings=6)
+    # fallback nearest point
+    nz = nearest_point_xyz(idx, px, py, max_rings=10)
+    return float(nz[2]) if nz is not None else None
 
 
 # ============================================================
 # Profile sampling + edge/bottom detection
 # ============================================================
-def _sample_profile(idx: TinIndex, x1, y1, x2, y2, step: float):
+def sample_profile(idx: TinIndex, x1, y1, x2, y2, step: float):
     L = math.hypot(x2 - x1, y2 - y1)
     if L < 1e-9:
         raise ValueError("Ristlõike joon on liiga lühike.")
-
     n = max(2, int(L / step) + 1)
     ds = np.linspace(0.0, L, n)
     zs = np.full(n, np.nan)
-
     for i in range(n):
         t = ds[i] / L
         px = x1 + t * (x2 - x1)
         py = y1 + t * (y2 - y1)
-        z = _z_at_xy(idx, px, py)
+        z = z_at_xy(idx, px, py)
         if z is not None:
             zs[i] = float(z)
-
     return ds, zs
 
 
-def _find_edges_and_depth(
+def find_edges_and_depth(
     ds: np.ndarray,
     zs: np.ndarray,
     tol: float,
@@ -291,10 +283,6 @@ def _find_edges_and_depth(
     min_depth_from_bottom: float = 0.3,
     center_window_m: float = 6.0,
 ):
-    """
-    Tagastab None või dict:
-      width, depth, bottom_z, edge_z, left_s, right_s, left_edge_z, right_edge_z
-    """
     valid = np.isfinite(zs)
     if valid.sum() < 5:
         return None
@@ -305,6 +293,7 @@ def _find_edges_and_depth(
     halfw = max(2, int((center_window_m / sample_step) / 2))
     i0 = max(0, mid - halfw)
     i1 = min(n, mid + halfw + 1)
+
     if valid[i0:i1].sum() < 3:
         i0, i1 = 0, n
 
@@ -346,7 +335,7 @@ def _find_edges_and_depth(
             right_edge_z = m
             break
 
-    if left_center is None or right_center is None or left_edge_z is None or right_edge_z is None:
+    if left_center is None or right_center is None:
         return None
 
     width = float(ds[right_center] - ds[left_center])
@@ -363,22 +352,15 @@ def _find_edges_and_depth(
         "depth": depth,
         "bottom_z": bottom_z,
         "edge_z": edge_z,
-        "left_s": float(ds[left_center]),
-        "right_s": float(ds[right_center]),
         "left_edge_z": float(left_edge_z),
         "right_edge_z": float(right_edge_z),
     }
 
 
 # ============================================================
-# Slope parser + area
+# Slope + area + pk formatting
 # ============================================================
 def parse_slope_ratio(text: str) -> float:
-    """
-    '1:2' -> 2.0 (H/V)
-    Tagastab H/V.
-    Lubab ka '2' (siis eeldame H/V=2).
-    """
     t = text.strip().replace(" ", "")
     if ":" in t:
         a, b = t.split(":", 1)
@@ -391,17 +373,20 @@ def parse_slope_ratio(text: str) -> float:
 
 
 def area_trapezoid(bottom_w: float, depth: float, slope_h_over_v: float) -> float:
-    """
-    Trapetsi pindala (m²), mõlemad küljed sama kalle:
-    top_w = bottom_w + 2*slope*depth
-    A = (bottom_w + top_w)/2 * depth
-    """
     top_w = bottom_w + 2.0 * slope_h_over_v * depth
     return (bottom_w + top_w) * 0.5 * depth
 
 
+def pk_fmt(meters: int) -> str:
+    km = meters // 1000
+    m = meters % 1000
+    if meters < 100:
+        return f"{km}+{m:02d}"
+    return f"{km}+{m:03d}"
+
+
 # ============================================================
-# Polyline util (ABS koordinaadid)
+# Polyline utils (ABS)
 # ============================================================
 def polyline_length(xy: List[Tuple[float, float]]) -> float:
     if not xy or len(xy) < 2:
@@ -459,16 +444,8 @@ def _point_and_tangent_at(xy: List[Tuple[float, float]], s: float):
     return (px, py), (tx / L, ty / L)
 
 
-def pk_fmt(meters: int) -> str:
-    km = meters // 1000
-    m = meters % 1000
-    if meters < 100:
-        return f"{km}+{m:02d}"
-    return f"{km}+{m:03d}"
-
-
 # ============================================================
-# Main: compute PK table
+# Main: PK table compute (ABS axis, TIN from LandXML)
 # ============================================================
 def compute_pk_table_from_landxml(
     xml_bytes: bytes,
@@ -482,64 +459,47 @@ def compute_pk_table_from_landxml(
     slope_text: str,
     bottom_w: float,
 ):
-    """
-    Arvutab PK tabeli telje (polyline) järgi.
-    Tagastab dict:
-      {
-        "rows": [ ... ],
-        "total_volume_m3": float,
-        "axis_length_m": float,
-        "count": int
-      }
-    """
     if not axis_xy or len(axis_xy) < 2:
-        raise ValueError("Axis peab olema vähemalt 2 punktiga.")
+        raise ValueError("Telg peab olema vähemalt 2 punktiga.")
 
     pts, faces = read_landxml_tin_from_bytes(xml_bytes)
     if not pts:
-        raise ValueError("LandXML-ist ei leitud ühtegi punkti.")
+        raise ValueError("LandXML-ist ei leitud punkte.")
 
-    idx = _build_tin_index(pts, faces)
-
-    axis_length_m = polyline_length(axis_xy)
-    if axis_length_m <= 0:
+    idx = build_tin_index(pts, faces)
+    axis_len = polyline_length(axis_xy)
+    if axis_len <= 0:
         raise ValueError("Telje pikkus on 0.")
 
-    if pk_step <= 0:
-        raise ValueError("PK samm peab olema > 0.")
-
-    count = int(math.floor(axis_length_m / pk_step))
+    count = int(math.floor(axis_len / pk_step))
     if count <= 0:
         raise ValueError("Telg on lühem kui PK samm.")
 
-    half = cross_len / 2.0
     slope_hv = parse_slope_ratio(slope_text)
+    half = cross_len / 2.0
 
     rows = []
-    total_volume = 0.0
+    total_v = 0.0
 
     for k in range(1, count + 1):
         s = k * pk_step
         (px, py), (tx, ty) = _point_and_tangent_at(axis_xy, s)
 
-        # normaal ristlõikele
-        nx = -ty
-        ny = tx
+        nx, ny = -ty, tx  # normal
 
         x1 = px - nx * half
         y1 = py - ny * half
         x2 = px + nx * half
         y2 = py + ny * half
 
-        ds, zs = _sample_profile(idx, x1, y1, x2, y2, step=sample_step)
-
-        info = _find_edges_and_depth(
+        ds, zs = sample_profile(idx, x1, y1, x2, y2, step=sample_step)
+        info = find_edges_and_depth(
             ds, zs,
             tol=tol,
             min_run=min_run,
             sample_step=sample_step,
             min_depth_from_bottom=min_depth_from_bottom,
-            center_window_m=min(6.0, cross_len / 3.0),
+            center_window_m=min(6.0, cross_len / 3.0)
         )
 
         pk_label = pk_fmt(int(round(s)))
@@ -563,7 +523,7 @@ def compute_pk_table_from_landxml(
 
         A = float(area_trapezoid(bottom_w=bottom_w, depth=depth, slope_h_over_v=slope_hv))
         V = float(A * pk_step)
-        total_volume += V
+        total_v += V
 
         rows.append({
             "PK": pk_label,
@@ -577,7 +537,7 @@ def compute_pk_table_from_landxml(
 
     return {
         "rows": rows,
-        "total_volume_m3": float(total_volume),
-        "axis_length_m": float(axis_length_m),
+        "total_volume_m3": float(total_v),
+        "axis_length_m": float(axis_len),
         "count": int(count),
     }
