@@ -251,37 +251,29 @@ def render_projects_view():
                     st.success("Telg lõpetatud.")
                     st.rerun()
 
-        st.caption("👉 Klikk ükskõik kuhu (ka tühjale alale) — lisame teljele **lähima TIN punkti** (snap).")
+        st.caption("👉 Klikk graafikul lisab telje punkti. Zoom: hiirerullik. Pan: lohista.")
 
-        # uirev: sõltub LandXML key-st (või originist) => uus fail resetib vaate
-uirev = f"tin_{st.session_state.get('landxml_key','')}_{E0:.3f}_{N0:.3f}"
+# NB! streamlit-plotly-events ei toeta kõigis versioonides config=... parameetrit.
+# Seepärast paneme scrollZoom otse fig layouti sisse.
+fig.update_layout(
+    dragmode="pan",
+)
 
-fig = _make_fig(xy_local_show, axis_local, uirev=uirev)
+click_data = plotly_events(
+    fig,
+    click_event=True,
+    select_event=False,
+    hover_event=False,
+    override_height=650,
+    key="tin_plot_events",
+)
 
-        # IMPORTANT: streamlit-plotly-events==0.0.6 -> NO config= argument!
-        click_data = plotly_events(
-            fig,
-            click_event=True,
-            select_event=False,
-            hover_event=False,
-            override_height=650,
-            key="tin_plot_events",
-        )
-
-        if click_data and not st.session_state["axis_finished"]:
-            # click returns LOCAL coords
-            cx_local = float(click_data[0]["x"])
-            cy_local = float(click_data[0]["y"])
-
-            # convert to ABS
-            cx_abs = cx_local + E0
-            cy_abs = cy_local + N0
-
-            # snap to nearest TIN point (ABS)
-            sx, sy = snap_xy_to_tin(idx, cx_abs, cy_abs)
-
-            st.session_state["axis_abs"] = st.session_state["axis_abs"] + [(sx, sy)]
-            st.rerun()
+if click_data and (not finished):
+    x = float(click_data[0]["x"])
+    y = float(click_data[0]["y"])
+    st.session_state["axis_xy"] = axis_xy + [(x, y)]
+    st.rerun()
+rerun()
 
         if st.session_state["axis_abs"]:
             L = polyline_length(st.session_state["axis_abs"])
