@@ -268,12 +268,14 @@ click_data = plotly_events(
     key="tin_plot_events",
 )
 
-if click_data and (not finished):
-    x = float(click_data[0]["x"])
-    y = float(click_data[0]["y"])
-    st.session_state["axis_xy"] = axis_xy + [(x, y)]
-    st.rerun()
-rerun()
+# ⬇⬇⬇ SAMA INDENT ⬇⬇⬇
+if st.session_state["axis_abs"]:
+    if click_data:
+        x = float(click_data[0]["x"])
+        y = float(click_data[0]["y"])
+        st.session_state["axis_xy"].append((x, y))
+        st.rerun()
+
 
         if st.session_state["axis_abs"]:
             L = polyline_length(st.session_state["axis_abs"])
