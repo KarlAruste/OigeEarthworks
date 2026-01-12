@@ -34,7 +34,7 @@ def _downsample(xy: np.ndarray, max_pts: int = 60000) -> np.ndarray:
     return xy[idx]
 
 
-def _make_fig(points_local: np.ndarray, axis_local: list):
+def _make_fig(points_local: np.ndarray, axis_local: list, uirev: str):
     fig = go.Figure()
 
     if points_local is None or len(points_local) == 0:
@@ -45,11 +45,22 @@ def _make_fig(points_local: np.ndarray, axis_local: list):
         )
         return fig
 
+    # ---- FORCE RANGE (see fixib “0...0” / tühi vaade) ----
+    xmin = float(np.min(points_local[:, 0]))
+    xmax = float(np.max(points_local[:, 0]))
+    ymin = float(np.min(points_local[:, 1]))
+    ymax = float(np.max(points_local[:, 1]))
+
+    dx = (xmax - xmin) if xmax > xmin else 1.0
+    dy = (ymax - ymin) if ymax > ymin else 1.0
+    pad_x = dx * 0.08
+    pad_y = dy * 0.08
+
     fig.add_trace(go.Scattergl(
-        x=points_local[:, 0],
-        y=points_local[:, 1],
+        x=points_local[:, 0].astype(float),
+        y=points_local[:, 1].astype(float),
         mode="markers",
-        marker=dict(size=3, opacity=0.7),
+        marker=dict(size=4, opacity=0.75),
         name="TIN punktid",
         hoverinfo="skip",
     ))
@@ -70,11 +81,17 @@ def _make_fig(points_local: np.ndarray, axis_local: list):
         title="Pealtvaade (kohalikud koordinaadid) – kliki telje punktide lisamiseks",
         margin=dict(l=10, r=10, t=40, b=10),
         dragmode="pan",
-        uirevision="keep",
         legend=dict(orientation="h"),
+        # uirevision peab muutuma, kui uus mudel laetakse (siis range resetib)
+        uirevision=uirev,
     )
-    fig.update_yaxes(scaleanchor="x", scaleratio=1)
+
+    fig.update_xaxes(title="E (local, m)", range=[xmin - pad_x, xmax + pad_x], tickformat=".0f")
+    fig.update_yaxes(title="N (local, m)", range=[ymin - pad_y, ymax + pad_y], tickformat=".0f",
+                     scaleanchor="x", scaleratio=1)
+
     return fig
+
 
 
 def render_projects_view():
