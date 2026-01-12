@@ -1,19 +1,12 @@
 # landxml.py
+from lxml import etree
+import numpy as np
 import math
 from dataclasses import dataclass
 from typing import Dict, Tuple, List, Optional
 
-import numpy as np
-from lxml import etree
-
-
-
-# ============================================================
-# LandXML TIN lugemine (bytes -> pts, faces)
-# ============================================================
 def read_landxml_tin_from_bytes(xml_bytes: bytes):
     root = etree.fromstring(xml_bytes)
-
     ns_uri = root.nsmap.get(None)
     ns = {"lx": ns_uri} if ns_uri else {}
 
@@ -26,28 +19,32 @@ def read_landxml_tin_from_bytes(xml_bytes: bytes):
     if not p_elems or not f_elems:
         raise ValueError("LandXML-ist ei leitud TIN Pnts/Faces (Surfaces/Definition/Pnts/Faces).")
 
-    pts: Dict[int, Tuple[float, float, float]] = {}
+    # loe punktid
+    raw = []
+    pts = {}
     for p in p_elems:
         pid = int(p.get("id"))
         a, b, z = map(float, p.text.strip().split())
+        raw.append((a, b))
+        pts[pid] = (a, b, z)
 
-        # LandXML-is võib olla (N,E,Z) või (E,N,Z).
-        # Sinu näide: 6568466(N), 609910(E), Z
-        # Me tahame hoida: X=E, Y=N
-        # Heuristika: kui esimene on "miljonites" ja teine "sadas tuhandetes", siis swap.
-        if a > 2_000_000 and b < 2_000_000:
-            x, y = b, a
-        else:
-            x, y = a, b
+    # --- AUTO-SWAP: kui esimene koord on ~6-7 miljonit ja teine ~0.x-1.x miljonit,
+    # siis see on tüüpiliselt (N, E). Me tahame (E, N).
+    arr = np.array(raw, dtype=float)
+    med0 = float(np.median(arr[:, 0]))
+    med1 = float(np.median(arr[:, 1]))
+    swapped = (med0 > 2_000_000 and med1 < 2_000_000)
 
-        pts[pid] = (float(x), float(y), float(z))
+    if swapped:
+        pts = {pid: (y, x, z) for pid, (x, y, z) in pts.items()}
 
-    faces: List[Tuple[int, int, int]] = []
+    faces = []
     for f in f_elems:
         a, b, c = map(int, f.text.strip().split())
         faces.append((a, b, c))
 
     return pts, faces
+
 
 
 # ============================================================
