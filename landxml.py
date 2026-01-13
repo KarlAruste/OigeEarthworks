@@ -241,7 +241,6 @@ def snap_xy_to_tin(idx: TinIndex, px: float, py: float) -> Tuple[float, float]:
         return float(px), float(py)
     return float(nn[0]), float(nn[1])
 
-
 # ----------------------------
 # Profiles + edges/depth
 # ----------------------------
