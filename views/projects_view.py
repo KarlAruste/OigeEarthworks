@@ -29,44 +29,65 @@ from landxml import (
 def _downsample(xy: np.ndarray, max_pts: int = 60000) -> np.ndarray:
     if xy is None or xy.size == 0:
         return xy
-    if xy.shape[0] <= max_pts:
+    n = xy.shape[0]
+    if n <= max_pts:
         return xy
-    idx = np.random.choice(xy.shape[0], size=max_pts, replace=False)
+    idx = np.random.choice(n, size=max_pts, replace=False)
     return xy[idx]
+
+
+def _finite_xy(xy: np.ndarray) -> np.ndarray:
+    """Keep only finite X,Y rows."""
+    if xy is None or xy.size == 0:
+        return xy
+    m = np.isfinite(xy[:, 0]) & np.isfinite(xy[:, 1])
+    return xy[m]
 
 
 def _make_fig(points_local: np.ndarray, axis_local: list, uirev: str):
     fig = go.Figure()
 
-    if points_local is None or len(points_local) == 0:
+    if points_local is None or points_local.size == 0:
         fig.update_layout(
             height=650,
-            title="TIN punkte ei leitud (kontrolli LandXML)",
+            title="TIN punkte ei ole (või kõik olid NaN/Inf). Kontrolli LandXML-i.",
             margin=dict(l=10, r=10, t=40, b=10),
         )
         return fig
 
-    xmin = float(np.min(points_local[:, 0]))
-    xmax = float(np.max(points_local[:, 0]))
-    ymin = float(np.min(points_local[:, 1]))
-    ymax = float(np.max(points_local[:, 1]))
+    # robust bounds
+    xmin = float(np.nanmin(points_local[:, 0]))
+    xmax = float(np.nanmax(points_local[:, 0]))
+    ymin = float(np.nanmin(points_local[:, 1]))
+    ymax = float(np.nanmax(points_local[:, 1]))
+
+    if not np.isfinite([xmin, xmax, ymin, ymax]).all():
+        fig.update_layout(
+            height=650,
+            title="TIN punktide piirid (min/max) olid NaN/Inf – kontrolli andmeid.",
+            margin=dict(l=10, r=10, t=40, b=10),
+        )
+        return fig
 
     dx = (xmax - xmin) if xmax > xmin else 1.0
     dy = (ymax - ymin) if ymax > ymin else 1.0
     pad_x = dx * 0.08
     pad_y = dy * 0.08
 
+    # Points
     fig.add_trace(
         go.Scattergl(
             x=points_local[:, 0].astype(float),
             y=points_local[:, 1].astype(float),
             mode="markers",
-            marker=dict(size=4, opacity=0.75),
+            marker=dict(size=3, opacity=0.75),
             name="TIN punktid",
             hoverinfo="skip",
+            showlegend=False,
         )
     )
 
+    # Axis polyline
     if axis_local and len(axis_local) >= 1:
         xs = [p[0] for p in axis_local]
         ys = [p[1] for p in axis_local]
@@ -86,14 +107,14 @@ def _make_fig(points_local: np.ndarray, axis_local: list, uirev: str):
         title="Pealtvaade (kohalikud koordinaadid) – kliki telje punktide lisamiseks",
         margin=dict(l=10, r=10, t=40, b=10),
         dragmode="pan",
-        legend=dict(orientation="h"),
-        uirevision=uirev,  # hoiab zoomi/pani
+        uirevision=uirev,  # hoiab zoom/pan alles rerunil
     )
 
     fig.update_xaxes(
         title="E (local, m)",
         range=[xmin - pad_x, xmax + pad_x],
         tickformat=".0f",
+        zeroline=False,
     )
     fig.update_yaxes(
         title="N (local, m)",
@@ -101,6 +122,7 @@ def _make_fig(points_local: np.ndarray, axis_local: list, uirev: str):
         tickformat=".0f",
         scaleanchor="x",
         scaleratio=1,
+        zeroline=False,
     )
 
     return fig
@@ -117,8 +139,6 @@ def render_projects_view():
     st.session_state.setdefault("landxml_bytes", None)
     st.session_state.setdefault("landxml_key", None)
 
-    st.session_state.setdefault("tin_pts", None)      # dict id->(E,N,Z)
-    st.session_state.setdefault("tin_faces", None)
     st.session_state.setdefault("tin_index", None)    # TinIndex
     st.session_state.setdefault("origin_EN", None)    # (E0,N0)
 
@@ -127,7 +147,7 @@ def render_projects_view():
     st.session_state.setdefault("axis_drawing", False)
 
     st.session_state.setdefault("plot_uirev", "init")
-    st.session_state.setdefault("last_click_sig", None)  # debounce
+    st.session_state.setdefault("last_click_sig", None)
 
     debug = st.checkbox("DEBUG", value=False)
 
@@ -166,16 +186,16 @@ def render_projects_view():
             if st.button(proj["name"], use_container_width=True, key=f"projbtn_{proj['id']}"):
                 st.session_state["active_project_id"] = proj["id"]
 
-                # reset when switching
+                # reset
                 st.session_state["landxml_bytes"] = None
                 st.session_state["landxml_key"] = None
-                st.session_state["tin_pts"] = None
-                st.session_state["tin_faces"] = None
                 st.session_state["tin_index"] = None
                 st.session_state["origin_EN"] = None
+
                 st.session_state["axis_abs"] = []
                 st.session_state["axis_finished"] = False
                 st.session_state["axis_drawing"] = False
+
                 st.session_state["plot_uirev"] = f"init-{proj['id']}"
                 st.session_state["last_click_sig"] = None
                 st.rerun()
@@ -211,13 +231,20 @@ def render_projects_view():
             idx = build_tin_index(pts, faces)
 
             xyz = idx.pts_xyz  # (E,N,Z)
-            E0 = float(np.median(xyz[:, 0]))
-            N0 = float(np.median(xyz[:, 1]))
+
+            # filter finite (E,N)
+            xy_abs = np.column_stack([xyz[:, 0], xyz[:, 1]])
+            xy_abs = _finite_xy(xy_abs)
+
+            if xy_abs is None or xy_abs.size == 0:
+                st.error("LandXML-ist tuli 0 finite (E,N) punkti. Kontrolli LandXML koordinaate.")
+                return
+
+            E0 = float(np.median(xy_abs[:, 0]))
+            N0 = float(np.median(xy_abs[:, 1]))
 
             st.session_state["landxml_bytes"] = xml_bytes
             st.session_state["landxml_key"] = key
-            st.session_state["tin_pts"] = pts
-            st.session_state["tin_faces"] = faces
             st.session_state["tin_index"] = idx
             st.session_state["origin_EN"] = (E0, N0)
 
@@ -225,10 +252,9 @@ def render_projects_view():
             st.session_state["axis_finished"] = False
             st.session_state["axis_drawing"] = False
             st.session_state["last_click_sig"] = None
-
             st.session_state["plot_uirev"] = f"model-{pid}-{key}"
 
-            st.success(f"LandXML laetud. Punkte: {len(pts):,} | Faces: {len(faces):,}")
+            st.success(f"LandXML laetud. Punkte: {xyz.shape[0]:,} | Faces: {idx.tris.shape[0]:,}")
             st.rerun()
 
         if not st.session_state["tin_index"]:
@@ -239,16 +265,31 @@ def render_projects_view():
         E0, N0 = st.session_state["origin_EN"]
 
         xyz = idx.pts_xyz
-        xy_local = np.column_stack([xyz[:, 0] - E0, xyz[:, 1] - N0])
+        xy_abs_full = np.column_stack([xyz[:, 0], xyz[:, 1]])
+        xy_abs_full = _finite_xy(xy_abs_full)
+
+        if xy_abs_full is None or xy_abs_full.size == 0:
+            st.error("TIN punktid on olemas, aga kõik (E,N) olid NaN/Inf. Ei saa joonistada.")
+            return
+
+        # local coords
+        xy_local = np.column_stack([xy_abs_full[:, 0] - E0, xy_abs_full[:, 1] - N0])
+        xy_local = _finite_xy(xy_local)
         xy_local_show = _downsample(xy_local, max_pts=60000)
+
+        # show stats (this will tell immediately if we have data)
+        st.caption(f"Punkte (finite E,N): {xy_abs_full.shape[0]:,} | Kuvan: {xy_local_show.shape[0]:,}")
+        if debug:
+            st.write(
+                "DEBUG local min/max:",
+                float(np.min(xy_local_show[:, 0])),
+                float(np.max(xy_local_show[:, 0])),
+                float(np.min(xy_local_show[:, 1])),
+                float(np.max(xy_local_show[:, 1])),
+            )
 
         axis_abs = st.session_state["axis_abs"]
         axis_local = [(E - E0, N - N0) for (E, N) in axis_abs]
-
-        st.caption(
-            f"ABS E min/max: {xyz[:,0].min():.3f} / {xyz[:,0].max():.3f} | "
-            f"ABS N min/max: {xyz[:,1].min():.3f} / {xyz[:,1].max():.3f}"
-        )
 
         # ---------------- Axis UI ----------------
         st.markdown("### 🧭 Telje joonistamine (kliki pildil)")
@@ -291,7 +332,7 @@ def render_projects_view():
         finished = st.session_state["axis_finished"]
 
         snap_on = st.checkbox("Snap telje punktid TIN-i lähimale tipule", value=True)
-        st.write(f"**Telje režiim:** {'✅ ON' if drawing else '❌ OFF'} | **Telg lõpetatud:** {finished}")
+        st.write(f"Telje režiim: {'✅ ON' if drawing else '❌ OFF'} | Telg lõpetatud: {finished}")
 
         # ---------------- Plot + click capture ----------------
         fig = _make_fig(
@@ -312,7 +353,6 @@ def render_projects_view():
         if debug:
             st.write("DEBUG click_data:", click_data)
 
-        # add point only when drawing is ON and not finished
         if drawing and (not finished) and click_data:
             x_local = float(click_data[0]["x"])
             y_local = float(click_data[0]["y"])
