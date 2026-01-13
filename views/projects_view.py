@@ -1,8 +1,7 @@
 # views/projects_view.py
 # Canvas-põhine telje joonistamine Streamlitis (Renderis töökindel)
-# FIX: ära kasuta f-stringi HTML/JS jaoks -> muidu { } põhjustab SyntaxError
-# Klikk tagastab JSON-stringi + t:Date.now() (debounce)
-# Valikuline: snap telg TIN lähimale tipule
+# Parandus: "joonista telg" režiim + komponent tagastab objekti (mitte JSON-stringi)
+# Lisatud DEBUG, et näha kas klikk jõuab Streamlitini
 
 import json
 import streamlit as st
@@ -39,7 +38,6 @@ from landxml import (
 # -------------------------
 
 def _downsample_points(xyz: np.ndarray, max_pts: int = 20000) -> np.ndarray:
-    """Downsample to keep the canvas fast."""
     if xyz is None or xyz.size == 0:
         return xyz
     n = xyz.shape[0]
@@ -50,9 +48,7 @@ def _downsample_points(xyz: np.ndarray, max_pts: int = 20000) -> np.ndarray:
 
 
 def _origin_abs(xyz_show_abs: np.ndarray) -> tuple[float, float]:
-    x0 = float(np.nanmean(xyz_show_abs[:, 0]))
-    y0 = float(np.nanmean(xyz_show_abs[:, 1]))
-    return (x0, y0)
+    return (float(np.nanmean(xyz_show_abs[:, 0])), float(np.nanmean(xyz_show_abs[:, 1])))
 
 
 def _abs_to_local(xyz_abs: np.ndarray, origin: tuple[float, float]) -> np.ndarray:
@@ -64,24 +60,25 @@ def _abs_to_local(xyz_abs: np.ndarray, origin: tuple[float, float]) -> np.ndarra
 
 
 # -------------------------
-# Canvas component (no build step)
+# Canvas component
 # -------------------------
 
 def canvas_pick_point(points_local_xy: np.ndarray, axis_local_xy: list[tuple[float, float]]):
     """
-    Interactive HTML5 canvas: pan+zoom, click returns local coord (wx, wy).
-    Returns JSON string from JS: {"picked":true,"x":...,"y":...,"t":...}
+    HTML5 canvas: pan+zoom, click returns local (x,y).
+    Returns Python dict from JS: {picked:true, x:..., y:..., t:...}
     """
     import streamlit.components.v1 as components
 
     pts = points_local_xy[:, :2].astype(float)
+
     payload = {
-        "points": pts.tolist(),  # [[x,y],...]
+        "points": pts.tolist(),
         "axis": [(float(a), float(b)) for (a, b) in axis_local_xy],
     }
     payload_json = json.dumps(payload)
 
-    # IMPORTANT: plain triple-quoted string (NOT f-string!)
+    # ÄRA kasuta f-stringi -> JS-is on palju { } ja see lõhub Python f-stringi
     html = r"""
 <!doctype html>
 <html>
@@ -100,7 +97,7 @@ def canvas_pick_point(points_local_xy: np.ndarray, axis_local_xy: list[tuple[flo
 <body>
   <div id="wrap">
     <div id="hud">
-      <div><b>Canvas</b> — Pan: lohista | Zoom: rullik | Kliki: lisa teljele punkt (täpselt kliki kohta)</div>
+      <div><b>Canvas</b> — Pan: lohista | Zoom: rullik | Kliki: lisa teljele punkt</div>
       <div id="info">—</div>
     </div>
     <canvas id="c"></canvas>
@@ -214,14 +211,6 @@ def canvas_pick_point(points_local_xy: np.ndarray, axis_local_xy: list[tuple[flo
       }
       ctx.restore();
     }
-
-    // crosshair
-    ctx.save();
-    ctx.strokeStyle = '#11182733';
-    ctx.lineWidth = 1;
-    ctx.beginPath(); ctx.moveTo(w/2,0); ctx.lineTo(w/2,h); ctx.stroke();
-    ctx.beginPath(); ctx.moveTo(0,h/2); ctx.lineTo(w,h/2); ctx.stroke();
-    ctx.restore();
   }
 
   // interaction
@@ -252,7 +241,6 @@ def canvas_pick_point(points_local_xy: np.ndarray, axis_local_xy: list[tuple[flo
     const mouseY = e.offsetY;
     const wxy = screenToWorld(mouseX, mouseY);
     const wx = wxy[0], wy = wxy[1];
-
     const zoom = Math.exp(-e.deltaY * 0.001);
     const newScale = Math.min(2000, Math.max(0.01, view.scale * zoom));
     view.ox = mouseX - wx*newScale;
@@ -270,11 +258,12 @@ def canvas_pick_point(points_local_xy: np.ndarray, axis_local_xy: list[tuple[flo
   }
 
   canvas.addEventListener('click', (e) => {
+    // klikk annab world koordinaadi (local)
     const wxy = screenToWorld(e.offsetX, e.offsetY);
     const wx = wxy[0], wy = wxy[1];
     info.textContent = "Klikk (local): E=" + wx.toFixed(3) + ", N=" + wy.toFixed(3);
-    // Always JSON string + unique timestamp (forces Streamlit update)
-    sendValue(JSON.stringify({picked:true, x:wx, y:wy, t: Date.now()}));
+    // SAADA OBJEKT (mitte stringify)
+    sendValue({picked:true, x:wx, y:wy, t: Date.now()});
   });
 
   function setSize() {
@@ -287,13 +276,11 @@ def canvas_pick_point(points_local_xy: np.ndarray, axis_local_xy: list[tuple[flo
   fit();
   draw();
   window.addEventListener('resize', () => { resize(); });
-
   window.parent.postMessage({ isStreamlitMessage:true, type:'streamlit:setFrameHeight', height: 670 }, '*');
 </script>
 </body>
 </html>
 """
-
     html = html.replace("__PAYLOAD__", payload_json)
     return components.html(html, height=670, scrolling=False)
 
@@ -310,19 +297,21 @@ def render_projects_view():
 
     # Session defaults
     st.session_state.setdefault("active_project_id", None)
-    st.session_state.setdefault("axis_xy", [])          # ABS [(E,N)]
+    st.session_state.setdefault("axis_xy", [])            # ABS [(E,N)]
     st.session_state.setdefault("axis_finished", False)
+    st.session_state.setdefault("axis_drawing", False)    # <-- PYCHARM MOODI REŽIIM
     st.session_state.setdefault("landxml_bytes", None)
     st.session_state.setdefault("landxml_key", None)
-    st.session_state.setdefault("plot_origin", None)    # ABS (E0,N0)
-    st.session_state.setdefault("xyz_show_cache", None) # ABS points for display
-    st.session_state.setdefault("tin_index", None)      # full index for snapping
-    st.session_state.setdefault("tin_sig", None)        # invalidation signature
-    st.session_state.setdefault("last_pick_id", None)   # click debounce
+    st.session_state.setdefault("plot_origin", None)      # ABS (E0,N0)
+    st.session_state.setdefault("xyz_show_cache", None)
+    st.session_state.setdefault("tin_index", None)
+    st.session_state.setdefault("tin_sig", None)
+    st.session_state.setdefault("last_pick_id", None)
+
+    debug = st.checkbox("DEBUG: näita canvas picked väärtust", value=False)
 
     # ---------------- Create project ----------------
     st.subheader("➕ Loo projekt")
-
     c1, c2, c3 = st.columns([2, 1, 1])
     with c1:
         name = st.text_input("Projekti nimi", placeholder="nt Objekt_01")
@@ -357,6 +346,7 @@ def render_projects_view():
                 st.session_state["active_project_id"] = proj["id"]
                 st.session_state["axis_xy"] = []
                 st.session_state["axis_finished"] = False
+                st.session_state["axis_drawing"] = False
                 st.session_state["landxml_bytes"] = None
                 st.session_state["landxml_key"] = None
                 st.session_state["plot_origin"] = None
@@ -394,6 +384,7 @@ def render_projects_view():
 
             st.session_state["axis_xy"] = []
             st.session_state["axis_finished"] = False
+            st.session_state["axis_drawing"] = False
             st.session_state["plot_origin"] = None
             st.session_state["xyz_show_cache"] = None
             st.session_state["tin_index"] = None
@@ -411,7 +402,7 @@ def render_projects_view():
             st.info("Lae LandXML üles, et saaks telge joonistada.")
             return
 
-        # build index once
+        # read points + build index once
         try:
             pts_dict, faces = read_landxml_tin_from_bytes(xml_bytes)
             xyz = np.array(list(pts_dict.values()), dtype=float)  # (E,N,Z)
@@ -426,10 +417,10 @@ def render_projects_view():
                 st.session_state["tin_index"] = build_tin_index(pts_dict, faces)
                 st.session_state["tin_sig"] = sig
 
-            x_min = float(np.nanmin(xyz_show[:, 0])); x_max = float(np.nanmax(xyz_show[:, 0]))
-            y_min = float(np.nanmin(xyz_show[:, 1])); y_max = float(np.nanmax(xyz_show[:, 1]))
-            st.caption(f"ABS X min/max: {x_min:.3f} / {x_max:.3f} | ABS Y min/max: {y_min:.3f} / {y_max:.3f}")
-
+            st.caption(
+                f"ABS X min/max: {float(np.nanmin(xyz_show[:,0])):.3f} / {float(np.nanmax(xyz_show[:,0])):.3f} | "
+                f"ABS Y min/max: {float(np.nanmin(xyz_show[:,1])):.3f} / {float(np.nanmax(xyz_show[:,1])):.3f}"
+            )
         except Exception as e:
             st.error(f"LandXML lugemine ebaõnnestus: {e}")
             return
@@ -440,6 +431,7 @@ def render_projects_view():
             if st.button("Alusta / joonista telg", use_container_width=True):
                 st.session_state["axis_xy"] = []
                 st.session_state["axis_finished"] = False
+                st.session_state["axis_drawing"] = True   # <-- režiim sisse
                 st.session_state["last_pick_id"] = None
                 st.rerun()
         with cB:
@@ -452,6 +444,7 @@ def render_projects_view():
             if st.button("Tühjenda telg", use_container_width=True):
                 st.session_state["axis_xy"] = []
                 st.session_state["axis_finished"] = False
+                st.session_state["axis_drawing"] = True
                 st.session_state["last_pick_id"] = None
                 st.rerun()
         with cD:
@@ -460,11 +453,13 @@ def render_projects_view():
                     st.warning("Telg peab olema vähemalt 2 punktiga.")
                 else:
                     st.session_state["axis_finished"] = True
+                    st.session_state["axis_drawing"] = False  # <-- režiim välja
                     st.success("Telg lõpetatud.")
                     st.rerun()
 
         axis_xy_abs = st.session_state["axis_xy"]
         finished = st.session_state["axis_finished"]
+        drawing = st.session_state["axis_drawing"]
         origin = st.session_state["plot_origin"]
         xyz_show_abs = st.session_state["xyz_show_cache"]
         idx_full = st.session_state["tin_index"]
@@ -474,35 +469,27 @@ def render_projects_view():
         xyz_show_local = _abs_to_local(xyz_show_abs, origin)
         axis_local = [(a - origin[0], b - origin[1]) for (a, b) in axis_xy_abs]
 
-        st.caption("Canvas: klikk lisab punkti täpselt kliki kohta (PyCharm moodi). Pan: lohista. Zoom: rullik.")
+        st.caption(
+            "Canvas: klikk annab world koordinaadi (local). Punkt lisatakse ainult siis, kui režiim 'joonista telg' on sees."
+        )
+        st.write(f"**Telje režiim:** {'✅ ON' if drawing else '❌ OFF'}  |  **Telg lõpetatud:** {finished}")
 
         picked = canvas_pick_point(xyz_show_local, axis_local)
 
-        # --- normalize picked payload (often arrives as JSON string) ---
-        picked_obj = None
-        if picked:
-            if isinstance(picked, str):
-                try:
-                    picked_obj = json.loads(picked)
-                except Exception:
-                    picked_obj = None
-            elif isinstance(picked, dict):
-                picked_obj = picked
+        if debug:
+            st.write("DEBUG picked:", picked)
 
-        # --- handle click once (debounce) ---
-        if picked_obj and picked_obj.get("picked") and (not finished):
-            pick_id = picked_obj.get("t")
+        # Handle click once (debounce) + only if drawing is ON
+        if drawing and (not finished) and picked and isinstance(picked, dict) and picked.get("picked"):
+            pick_id = picked.get("t")
             if pick_id is None:
-                try:
-                    pick_id = f"{float(picked_obj.get('x')):.6f}:{float(picked_obj.get('y')):.6f}"
-                except Exception:
-                    pick_id = None
+                pick_id = f"{float(picked.get('x',0)):.6f}:{float(picked.get('y',0)):.6f}"
 
-            if pick_id is not None and st.session_state.get("last_pick_id") != pick_id:
+            if st.session_state.get("last_pick_id") != pick_id:
                 st.session_state["last_pick_id"] = pick_id
 
-                lx = float(picked_obj.get("x"))
-                ly = float(picked_obj.get("y"))
+                lx = float(picked.get("x"))
+                ly = float(picked.get("y"))
 
                 # local -> ABS
                 cx_abs = lx + origin[0]
@@ -571,7 +558,6 @@ def render_projects_view():
                 )
 
                 st.dataframe(df, use_container_width=True)
-
                 csv = df.to_csv(index=False, sep=";").encode("utf-8")
                 st.download_button(
                     "⬇️ Lae alla CSV",
@@ -581,11 +567,9 @@ def render_projects_view():
                     use_container_width=True,
                 )
 
-                st.info("Tulemused salvestati projekti planned_* väljade alla (DB).")
-
         st.divider()
 
-        # ---------------- R2 file upload ----------------
+        # ---------------- R2 files ----------------
         st.subheader("📤 Failid (Cloudflare R2)")
         uploads = st.file_uploader("Laadi üles failid", accept_multiple_files=True, key="proj_files")
         if uploads:
@@ -595,7 +579,6 @@ def render_projects_view():
             st.success(f"Üles laaditud {len(uploads)} faili.")
             st.rerun()
 
-        # ---------------- File list ----------------
         st.subheader("📄 Projekti failid")
         prefix = project_prefix(p["name"])
         files = list_files(s3, prefix)
