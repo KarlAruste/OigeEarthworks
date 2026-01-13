@@ -1,7 +1,8 @@
 # views/projects_view.py
-# Canvas-põhine telje joonistamine Streamlitis (PyCharm moodi: klikk lisab punkti täpselt kliki kohta)
-# + valikuline SNAP TIN-i (checkbox)
-# + FIX: components.html tagastus võib tulla stringina -> json.loads + click debounce (t: Date.now())
+# Canvas-põhine telje joonistamine Streamlitis (Renderis töökindel)
+# FIX: ära kasuta f-stringi HTML/JS jaoks -> muidu { } põhjustab SyntaxError
+# Klikk tagastab JSON-stringi + t:Date.now() (debounce)
+# Valikuline: snap telg TIN lähimale tipule
 
 import json
 import streamlit as st
@@ -68,30 +69,32 @@ def _abs_to_local(xyz_abs: np.ndarray, origin: tuple[float, float]) -> np.ndarra
 
 def canvas_pick_point(points_local_xy: np.ndarray, axis_local_xy: list[tuple[float, float]]):
     """
-    PyCharm-style: click returns the exact world/local coordinate (no nearest point selection).
-    Returns JSON string from JS (recommended), but may also be dict depending on Streamlit.
+    Interactive HTML5 canvas: pan+zoom, click returns local coord (wx, wy).
+    Returns JSON string from JS: {"picked":true,"x":...,"y":...,"t":...}
     """
     import streamlit.components.v1 as components
 
     pts = points_local_xy[:, :2].astype(float)
-    pts_list = pts.tolist()
-    axis_list = [(float(a), float(b)) for (a, b) in axis_local_xy]
+    payload = {
+        "points": pts.tolist(),  # [[x,y],...]
+        "axis": [(float(a), float(b)) for (a, b) in axis_local_xy],
+    }
+    payload_json = json.dumps(payload)
 
-    payload = {"points": pts_list, "axis": axis_list}
-
-    html = f"""
+    # IMPORTANT: plain triple-quoted string (NOT f-string!)
+    html = r"""
 <!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
   <style>
-    html, body {{ margin:0; padding:0; height:100%; width:100%; overflow:hidden; background:#fff; }}
-    #wrap {{ position:relative; height:100%; width:100%; }}
-    #hud {{ position:absolute; left:12px; top:10px; background:rgba(255,255,255,0.92);
-            padding:8px 10px; border:1px solid #ddd; border-radius:8px;
-            font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial; font-size:13px; }}
-    #hud b {{ font-weight:600; }}
-    canvas {{ display:block; }}
+    html, body { margin:0; padding:0; height:100%; width:100%; overflow:hidden; background:#fff; }
+    #wrap { position:relative; height:100%; width:100%; }
+    #hud { position:absolute; left:12px; top:10px; background:rgba(255,255,255,0.92);
+           padding:8px 10px; border:1px solid #ddd; border-radius:8px;
+           font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial; font-size:13px; }
+    #hud b { font-weight:600; }
+    canvas { display:block; }
   </style>
 </head>
 <body>
@@ -104,7 +107,7 @@ def canvas_pick_point(points_local_xy: np.ndarray, axis_local_xy: list[tuple[flo
   </div>
 
 <script>
-  const data = {json.dumps(payload)};
+  const data = __PAYLOAD__;
   const pts = data.points; // [[x,y],...]
   const axis = data.axis;  // [[x,y],...]
 
@@ -112,54 +115,55 @@ def canvas_pick_point(points_local_xy: np.ndarray, axis_local_xy: list[tuple[flo
   const info = document.getElementById('info');
   const ctx = canvas.getContext('2d');
 
-  function resize() {{
+  function resize() {
     const dpr = window.devicePixelRatio || 1;
     canvas.width = Math.floor(canvas.clientWidth * dpr);
     canvas.height = Math.floor(canvas.clientHeight * dpr);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     draw();
-  }}
+  }
 
-  function bounds() {{
+  function bounds() {
     let xmin=Infinity, xmax=-Infinity, ymin=Infinity, ymax=-Infinity;
-    for (const [x,y] of pts) {{
+    for (const p of pts) {
+      const x = p[0], y = p[1];
       if (x<xmin) xmin=x; if (x>xmax) xmax=x;
       if (y<ymin) ymin=y; if (y>ymax) ymax=y;
-    }}
-    if (!isFinite(xmin)) {{ xmin=-1; xmax=1; ymin=-1; ymax=1; }}
-    return {{xmin,xmax,ymin,ymax}};
-  }}
+    }
+    if (!isFinite(xmin)) { xmin=-1; xmax=1; ymin=-1; ymax=1; }
+    return {xmin,xmax,ymin,ymax};
+  }
 
-  let view = {{ scale: 1, ox: 0, oy: 0 }};
+  let view = { scale: 1, ox: 0, oy: 0 };
 
-  function fit() {{
-    const {{xmin,xmax,ymin,ymax}} = bounds();
+  function fit() {
+    const b = bounds();
     const w = canvas.clientWidth;
     const h = canvas.clientHeight;
-    const dx = (xmax-xmin) || 1;
-    const dy = (ymax-ymin) || 1;
+    const dx = (b.xmax-b.xmin) || 1;
+    const dy = (b.ymax-b.ymin) || 1;
     const sx = (w*0.85) / dx;
     const sy = (h*0.85) / dy;
     view.scale = Math.min(sx, sy);
-    const cx = (xmin+xmax)/2;
-    const cy = (ymin+ymax)/2;
+    const cx = (b.xmin+b.xmax)/2;
+    const cy = (b.ymin+b.ymax)/2;
     view.ox = w/2 - cx*view.scale;
     view.oy = h/2 + cy*view.scale; // y flip
-  }}
+  }
 
-  function worldToScreen(x,y) {{
+  function worldToScreen(x,y) {
     const sx = x*view.scale + view.ox;
     const sy = -y*view.scale + view.oy;
     return [sx,sy];
-  }}
+  }
 
-  function screenToWorld(sx,sy) {{
+  function screenToWorld(sx,sy) {
     const x = (sx - view.ox)/view.scale;
     const y = -(sy - view.oy)/view.scale;
     return [x,y];
-  }}
+  }
 
-  function draw() {{
+  function draw() {
     const w = canvas.clientWidth;
     const h = canvas.clientHeight;
     ctx.clearRect(0,0,w,h);
@@ -169,44 +173,47 @@ def canvas_pick_point(points_local_xy: np.ndarray, axis_local_xy: list[tuple[flo
     ctx.strokeStyle = '#eef2f6';
     ctx.lineWidth = 1;
     const step = 50;
-    for (let x=0; x<=w; x+=step) {{ ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,h); ctx.stroke(); }}
-    for (let y=0; y<=h; y+=step) {{ ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke(); }}
+    for (let x=0; x<=w; x+=step) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,h); ctx.stroke(); }
+    for (let y=0; y<=h; y+=step) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke(); }
     ctx.restore();
 
     // points
     ctx.save();
     ctx.fillStyle = 'rgba(75, 110, 255, 0.85)';
-    for (let i=0; i<pts.length; i++) {{
-      const [x,y] = pts[i];
-      const [sx,sy] = worldToScreen(x,y);
+    for (let i=0; i<pts.length; i++) {
+      const x = pts[i][0], y = pts[i][1];
+      const s = worldToScreen(x,y);
+      const sx = s[0], sy = s[1];
       if (sx<-10 || sy<-10 || sx>w+10 || sy>h+10) continue;
       ctx.beginPath();
       ctx.arc(sx,sy,2.4,0,Math.PI*2);
       ctx.fill();
-    }}
+    }
     ctx.restore();
 
     // axis polyline
-    if (axis && axis.length>0) {{
+    if (axis && axis.length>0) {
       ctx.save();
       ctx.strokeStyle = '#f59e0b';
       ctx.lineWidth = 3;
       ctx.beginPath();
-      for (let i=0; i<axis.length; i++) {{
-        const [x,y] = axis[i];
-        const [sx,sy] = worldToScreen(x,y);
+      for (let i=0; i<axis.length; i++) {
+        const x = axis[i][0], y = axis[i][1];
+        const s = worldToScreen(x,y);
+        const sx = s[0], sy = s[1];
         if (i===0) ctx.moveTo(sx,sy); else ctx.lineTo(sx,sy);
-      }}
+      }
       ctx.stroke();
 
       ctx.fillStyle = '#f59e0b';
-      for (let i=0; i<axis.length; i++) {{
-        const [x,y] = axis[i];
-        const [sx,sy] = worldToScreen(x,y);
+      for (let i=0; i<axis.length; i++) {
+        const x = axis[i][0], y = axis[i][1];
+        const s = worldToScreen(x,y);
+        const sx = s[0], sy = s[1];
         ctx.beginPath(); ctx.arc(sx,sy,5,0,Math.PI*2); ctx.fill();
-      }}
+      }
       ctx.restore();
-    }}
+    }
 
     // crosshair
     ctx.save();
@@ -215,20 +222,20 @@ def canvas_pick_point(points_local_xy: np.ndarray, axis_local_xy: list[tuple[flo
     ctx.beginPath(); ctx.moveTo(w/2,0); ctx.lineTo(w/2,h); ctx.stroke();
     ctx.beginPath(); ctx.moveTo(0,h/2); ctx.lineTo(w,h/2); ctx.stroke();
     ctx.restore();
-  }}
+  }
 
   // interaction
   let dragging=false;
   let lastX=0, lastY=0;
 
-  canvas.addEventListener('mousedown', (e) => {{
+  canvas.addEventListener('mousedown', (e) => {
     dragging = true;
     lastX = e.offsetX;
     lastY = e.offsetY;
-  }});
-  window.addEventListener('mouseup', () => {{ dragging=false; }});
+  });
+  window.addEventListener('mouseup', () => { dragging=false; });
 
-  canvas.addEventListener('mousemove', (e) => {{
+  canvas.addEventListener('mousemove', (e) => {
     if (!dragging) return;
     const dx = e.offsetX - lastX;
     const dy = e.offsetY - lastY;
@@ -237,13 +244,14 @@ def canvas_pick_point(points_local_xy: np.ndarray, axis_local_xy: list[tuple[flo
     view.ox += dx;
     view.oy += dy;
     draw();
-  }});
+  });
 
-  canvas.addEventListener('wheel', (e) => {{
+  canvas.addEventListener('wheel', (e) => {
     e.preventDefault();
     const mouseX = e.offsetX;
     const mouseY = e.offsetY;
-    const [wx, wy] = screenToWorld(mouseX, mouseY);
+    const wxy = screenToWorld(mouseX, mouseY);
+    const wx = wxy[0], wy = wxy[1];
 
     const zoom = Math.exp(-e.deltaY * 0.001);
     const newScale = Math.min(2000, Math.max(0.01, view.scale * zoom));
@@ -251,40 +259,42 @@ def canvas_pick_point(points_local_xy: np.ndarray, axis_local_xy: list[tuple[flo
     view.oy = mouseY + wy*newScale;
     view.scale = newScale;
     draw();
-  }}, {{ passive:false }});
+  }, { passive:false });
 
-  function sendValue(val) {{
-    window.parent.postMessage({{
+  function sendValue(val) {
+    window.parent.postMessage({
       isStreamlitMessage: true,
       type: 'streamlit:setComponentValue',
       value: val
-    }}, '*');
-  }}
+    }, '*');
+  }
 
-  canvas.addEventListener('click', (e) => {{
-    const [wx, wy] = screenToWorld(e.offsetX, e.offsetY);
-    info.textContent = `Klikk (local): E=${{wx.toFixed(3)}}, N=${{wy.toFixed(3)}}`;
-    // IMPORTANT: always send JSON string + unique timestamp to force Streamlit update
-    sendValue(JSON.stringify({{picked:true, x:wx, y:wy, t: Date.now()}}));
-  }});
+  canvas.addEventListener('click', (e) => {
+    const wxy = screenToWorld(e.offsetX, e.offsetY);
+    const wx = wxy[0], wy = wxy[1];
+    info.textContent = "Klikk (local): E=" + wx.toFixed(3) + ", N=" + wy.toFixed(3);
+    // Always JSON string + unique timestamp (forces Streamlit update)
+    sendValue(JSON.stringify({picked:true, x:wx, y:wy, t: Date.now()}));
+  });
 
-  function setSize() {{
+  function setSize() {
     canvas.style.width = '100%';
     canvas.style.height = '650px';
     resize();
-  }}
+  }
 
   setSize();
   fit();
   draw();
-  window.addEventListener('resize', () => {{ resize(); }});
+  window.addEventListener('resize', () => { resize(); });
 
-  window.parent.postMessage({{ isStreamlitMessage:true, type:'streamlit:setFrameHeight', height: 670 }}, '*');
+  window.parent.postMessage({ isStreamlitMessage:true, type:'streamlit:setFrameHeight', height: 670 }, '*');
 </script>
 </body>
 </html>
-    """
+"""
 
+    html = html.replace("__PAYLOAD__", payload_json)
     return components.html(html, height=670, scrolling=False)
 
 
@@ -404,7 +414,7 @@ def render_projects_view():
         # build index once
         try:
             pts_dict, faces = read_landxml_tin_from_bytes(xml_bytes)
-            xyz = np.array(list(pts_dict.values()), dtype=float)
+            xyz = np.array(list(pts_dict.values()), dtype=float)  # (E,N,Z)
             xyz_show = _downsample_points(xyz, max_pts=20000)
             st.session_state["xyz_show_cache"] = xyz_show
 
