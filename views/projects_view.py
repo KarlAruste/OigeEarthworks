@@ -1,6 +1,7 @@
 # views/projects_view.py
-# Canvas-põhine telje joonistamine Streamlitis (PyCharm moodi: klikk lisab punkti täpselt klikikohta)
+# Canvas-põhine telje joonistamine Streamlitis (PyCharm moodi: klikk lisab punkti täpselt kliki kohta)
 # + valikuline SNAP TIN-i (checkbox)
+# + FIX: components.html tagastus võib tulla stringina -> json.loads + click debounce (t: Date.now())
 
 import json
 import streamlit as st
@@ -68,9 +69,7 @@ def _abs_to_local(xyz_abs: np.ndarray, origin: tuple[float, float]) -> np.ndarra
 def canvas_pick_point(points_local_xy: np.ndarray, axis_local_xy: list[tuple[float, float]]):
     """
     PyCharm-style: click returns the exact world/local coordinate (no nearest point selection).
-    Returns dict like:
-      {"x": local_x, "y": local_y, "picked": true}
-    or None.
+    Returns JSON string from JS (recommended), but may also be dict depending on Streamlit.
     """
     import streamlit.components.v1 as components
 
@@ -88,7 +87,9 @@ def canvas_pick_point(points_local_xy: np.ndarray, axis_local_xy: list[tuple[flo
   <style>
     html, body {{ margin:0; padding:0; height:100%; width:100%; overflow:hidden; background:#fff; }}
     #wrap {{ position:relative; height:100%; width:100%; }}
-    #hud {{ position:absolute; left:12px; top:10px; background:rgba(255,255,255,0.92); padding:8px 10px; border:1px solid #ddd; border-radius:8px; font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial; font-size:13px; }}
+    #hud {{ position:absolute; left:12px; top:10px; background:rgba(255,255,255,0.92);
+            padding:8px 10px; border:1px solid #ddd; border-radius:8px;
+            font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial; font-size:13px; }}
     #hud b {{ font-weight:600; }}
     canvas {{ display:block; }}
   </style>
@@ -260,13 +261,13 @@ def canvas_pick_point(points_local_xy: np.ndarray, axis_local_xy: list[tuple[flo
     }}, '*');
   }}
 
-  canvas.addEventListener('click', (e) => {
-  const [wx, wy] = screenToWorld(e.offsetX, e.offsetY);
-  info.textContent = `Klikk (local): E=${wx.toFixed(3)}, N=${wy.toFixed(3)}`;
-  sendValue(JSON.stringify({picked:true, x:wx, y:wy, t: Date.now()}));
-   });
+  canvas.addEventListener('click', (e) => {{
+    const [wx, wy] = screenToWorld(e.offsetX, e.offsetY);
+    info.textContent = `Klikk (local): E=${{wx.toFixed(3)}}, N=${{wy.toFixed(3)}}`;
+    // IMPORTANT: always send JSON string + unique timestamp to force Streamlit update
+    sendValue(JSON.stringify({{picked:true, x:wx, y:wy, t: Date.now()}}));
+  }});
 
-     
   function setSize() {{
     canvas.style.width = '100%';
     canvas.style.height = '650px';
@@ -298,15 +299,16 @@ def render_projects_view():
     projects = list_projects()
 
     # Session defaults
-    st.session_state.setdefault("last_pick_id", None)
+    st.session_state.setdefault("active_project_id", None)
     st.session_state.setdefault("axis_xy", [])          # ABS [(E,N)]
     st.session_state.setdefault("axis_finished", False)
     st.session_state.setdefault("landxml_bytes", None)
     st.session_state.setdefault("landxml_key", None)
     st.session_state.setdefault("plot_origin", None)    # ABS (E0,N0)
     st.session_state.setdefault("xyz_show_cache", None) # ABS points for display
-    st.session_state.setdefault("tin_index", None)      # full index for optional snapping
+    st.session_state.setdefault("tin_index", None)      # full index for snapping
     st.session_state.setdefault("tin_sig", None)        # invalidation signature
+    st.session_state.setdefault("last_pick_id", None)   # click debounce
 
     # ---------------- Create project ----------------
     st.subheader("➕ Loo projekt")
@@ -351,6 +353,7 @@ def render_projects_view():
                 st.session_state["xyz_show_cache"] = None
                 st.session_state["tin_index"] = None
                 st.session_state["tin_sig"] = None
+                st.session_state["last_pick_id"] = None
                 st.rerun()
 
     with right:
@@ -385,6 +388,7 @@ def render_projects_view():
             st.session_state["xyz_show_cache"] = None
             st.session_state["tin_index"] = None
             st.session_state["tin_sig"] = None
+            st.session_state["last_pick_id"] = None
 
             st.success("LandXML salvestatud ja laaditud sessiooni.")
             st.rerun()
@@ -426,6 +430,7 @@ def render_projects_view():
             if st.button("Alusta / joonista telg", use_container_width=True):
                 st.session_state["axis_xy"] = []
                 st.session_state["axis_finished"] = False
+                st.session_state["last_pick_id"] = None
                 st.rerun()
         with cB:
             if st.button("Undo (eemalda viimane)", use_container_width=True):
@@ -437,6 +442,7 @@ def render_projects_view():
             if st.button("Tühjenda telg", use_container_width=True):
                 st.session_state["axis_xy"] = []
                 st.session_state["axis_finished"] = False
+                st.session_state["last_pick_id"] = None
                 st.rerun()
         with cD:
             if st.button("Lõpeta telg", use_container_width=True):
@@ -453,8 +459,7 @@ def render_projects_view():
         xyz_show_abs = st.session_state["xyz_show_cache"]
         idx_full = st.session_state["tin_index"]
 
-        # SNAP toggle (PyCharm vs TIN snap)
-        snap_on = st.checkbox("Snap telje punktid TIN-i lähimale tipule (soovi korral)", value=False)
+        snap_on = st.checkbox("Snap telje punktid TIN-i lähimale tipule (soovi korral)", value=True)
 
         xyz_show_local = _abs_to_local(xyz_show_abs, origin)
         axis_local = [(a - origin[0], b - origin[1]) for (a, b) in axis_xy_abs]
@@ -463,44 +468,44 @@ def render_projects_view():
 
         picked = canvas_pick_point(xyz_show_local, axis_local)
 
-# --- normalize picked payload (can arrive as JSON string) ---
-picked_obj = None
-if picked:
-    if isinstance(picked, str):
-        try:
-            picked_obj = json.loads(picked)
-        except Exception:
-            picked_obj = None
-    elif isinstance(picked, dict):
-        picked_obj = picked
+        # --- normalize picked payload (often arrives as JSON string) ---
+        picked_obj = None
+        if picked:
+            if isinstance(picked, str):
+                try:
+                    picked_obj = json.loads(picked)
+                except Exception:
+                    picked_obj = None
+            elif isinstance(picked, dict):
+                picked_obj = picked
 
-# --- handle click once (debounce) ---
-if picked_obj and picked_obj.get("picked") and (not finished):
-    # unique click id (timestamp from JS)
-    pick_id = picked_obj.get("t")
-    if pick_id is None:
-        # fallback: hash by coords
-        pick_id = f"{picked_obj.get('x'):.6f}:{picked_obj.get('y'):.6f}"
+        # --- handle click once (debounce) ---
+        if picked_obj and picked_obj.get("picked") and (not finished):
+            pick_id = picked_obj.get("t")
+            if pick_id is None:
+                try:
+                    pick_id = f"{float(picked_obj.get('x')):.6f}:{float(picked_obj.get('y')):.6f}"
+                except Exception:
+                    pick_id = None
 
-    if st.session_state.get("last_pick_id") != pick_id:
-        st.session_state["last_pick_id"] = pick_id
+            if pick_id is not None and st.session_state.get("last_pick_id") != pick_id:
+                st.session_state["last_pick_id"] = pick_id
 
-        lx = float(picked_obj.get("x"))
-        ly = float(picked_obj.get("y"))
+                lx = float(picked_obj.get("x"))
+                ly = float(picked_obj.get("y"))
 
-        # local -> ABS
-        cx_abs = lx + origin[0]
-        cy_abs = ly + origin[1]
+                # local -> ABS
+                cx_abs = lx + origin[0]
+                cy_abs = ly + origin[1]
 
-        if snap_on:
-            sx, sy = snap_xy_to_tin(idx_full, float(cx_abs), float(cy_abs))
-            new_pt = (float(sx), float(sy))
-        else:
-            new_pt = (float(cx_abs), float(cy_abs))
+                if snap_on:
+                    sx, sy = snap_xy_to_tin(idx_full, float(cx_abs), float(cy_abs))
+                    new_pt = (float(sx), float(sy))
+                else:
+                    new_pt = (float(cx_abs), float(cy_abs))
 
-        st.session_state["axis_xy"] = axis_xy_abs + [new_pt]
-        st.rerun()
-
+                st.session_state["axis_xy"] = axis_xy_abs + [new_pt]
+                st.rerun()
 
         if axis_xy_abs:
             L = polyline_length(axis_xy_abs)
