@@ -24,22 +24,17 @@ def _iter_by_local(root, local_name: str):
 # ----------------------------
 # Read LandXML TIN from bytes
 # Supports:
-#  - <Surfaces><Surface><Definition surfType="TIN"><Pnts><P ...>N E Z</P> ...</Pnts><Faces><F>...</F></Faces>
+#  - <Surfaces><Surface><Definition surfType="TIN"><Pnts><P id="..">N E Z</P>...</Pnts><Faces><F>...</F></Faces>
+# Output ALWAYS: pts {id: (E,N,Z)}
 # ----------------------------
 def read_landxml_tin_from_bytes(
-    xml_bytes: bytes,
+    xml_bytes: bytes
 ) -> Tuple[Dict[int, Tuple[float, float, float]], List[Tuple[int, int, int]]]:
-    """
-    Returns:
-      pts: {id: (E, N, Z)}  <-- ALWAYS E,N,Z in output
-      faces: [(a,b,c), ...]
-    """
+
     root = ET.fromstring(xml_bytes)
 
-    # --- points ---
     pts: Dict[int, Tuple[float, float, float]] = {}
 
-    # LandXML may contain many <P> nodes; we still iterate by local-name
     for p in _iter_by_local(root, "P"):
         pid = p.get("id")
         txt = (p.text or "").strip()
@@ -53,14 +48,13 @@ def read_landxml_tin_from_bytes(
             b = float(parts[1])
             z = float(parts[2])
             pid_i = int(pid)
-            pts[pid_i] = (a, b, z)  # TEMP, order fixed below
+            pts[pid_i] = (a, b, z)  # temp (order fixed below)
         except Exception:
             continue
 
     if not pts:
-        raise ValueError("LandXML: ei leidnud <P> punkte (Definition/Pnts/P).")
+        raise ValueError("LandXML: ei leidnud <P> punkte (Surfaces/Definition/Pnts/P).")
 
-    # --- faces ---
     faces: List[Tuple[int, int, int]] = []
     for f in _iter_by_local(root, "F"):
         txt = (f.text or "").strip()
@@ -76,18 +70,18 @@ def read_landxml_tin_from_bytes(
             continue
 
     if not faces:
-        raise ValueError("LandXML: ei leidnud <F> faces (Definition/Faces/F).")
+        raise ValueError("LandXML: ei leidnud <F> faces (Surfaces/Definition/Faces/F).")
 
     # --- Fix coordinate order ---
-    # Common in LandXML: N E Z (Northing ~ millions, Easting ~ hundreds of thousands).
-    # Output must be E N Z.
-    arr = np.array(list(pts.values()), dtype=float)  # (a,b,z)
+    # Many Estonian files are N E Z; we must output E N Z.
+    arr = np.array(list(pts.values()), dtype=float)
     a_med = float(np.median(arr[:, 0]))
     b_med = float(np.median(arr[:, 1]))
 
+    # If first looks like Northing (millions) and second like Easting (hundreds of thousands), swap.
     need_swap = (a_med > 2_000_000.0 and b_med < 2_000_000.0)
     if need_swap:
-        pts = {pid: (val[1], val[0], val[2]) for pid, val in pts.items()}  # E,N,Z
+        pts = {pid: (val[1], val[0], val[2]) for pid, val in pts.items()}
 
     return pts, faces
 
@@ -136,7 +130,7 @@ class TinIndex:
 def build_tin_index(
     pts: Dict[int, Tuple[float, float, float]],
     faces: List[Tuple[int, int, int]],
-    target_bucket_count: int = 150_000,
+    target_bucket_count: int = 150_000
 ) -> TinIndex:
     tris = np.empty((len(faces), 3, 3), dtype=float)
     for i, (a, b, c) in enumerate(faces):
@@ -153,7 +147,11 @@ def build_tin_index(
     cell = math.sqrt(area / max(target_bucket_count, 10_000))
     cell = max(cell, 0.5)
 
-    tri_bbox = np.stack([xs.min(axis=1), ys.min(axis=1), xs.max(axis=1), ys.max(axis=1)], axis=1)
+    tri_bbox = np.stack(
+        [xs.min(axis=1), ys.min(axis=1), xs.max(axis=1), ys.max(axis=1)],
+        axis=1
+    )
+
     tri_buckets = {}
     for i, bb in enumerate(tri_bbox):
         ix0 = int((bb[0] - minx) // cell)
@@ -172,17 +170,13 @@ def build_tin_index(
         pt_buckets.setdefault((ix, iy), []).append((float(x), float(y), float(z)))
 
     return TinIndex(
-        tris=tris,
-        minx=minx,
-        miny=miny,
-        cell=cell,
-        tri_buckets=tri_buckets,
-        pt_buckets=pt_buckets,
-        pts_xyz=pts_xyz,
+        tris=tris, minx=minx, miny=miny, cell=cell,
+        tri_buckets=tri_buckets, pt_buckets=pt_buckets,
+        pts_xyz=pts_xyz
     )
 
 
-def nearest_point_xyz(idx: TinIndex, px: float, py: float, max_rings: int = 8) -> Optional[Tuple[float, float, float]]:
+def nearest_point_xyz(idx: TinIndex, px: float, py: float, max_rings: int = 10) -> Optional[Tuple[float, float, float]]:
     ix = int((px - idx.minx) // idx.cell)
     iy = int((py - idx.miny) // idx.cell)
 
@@ -225,21 +219,17 @@ def z_at_xy(idx: TinIndex, px: float, py: float) -> Optional[float]:
             if z is not None:
                 return z
 
-    nn = nearest_point_xyz(idx, px, py, max_rings=8)
-    if nn is None:
-        return None
-    return float(nn[2])
+    nn = nearest_point_xyz(idx, px, py, max_rings=10)
+    return None if nn is None else float(nn[2])
 
 
-def snap_xy_to_tin(idx: TinIndex, px: float, py: float) -> Tuple[float, float]:
-    """
-    Snap an (E,N) point to nearest TIN vertex (fast via point buckets).
-    Returns (E, N).
-    """
+# BACKWARD COMPAT + better helper
+def snap_xy_to_tin(idx: TinIndex, px: float, py: float) -> Tuple[float, float, float]:
+    """Return nearest TIN vertex as (E,N,Z)."""
     nn = nearest_point_xyz(idx, px, py, max_rings=10)
     if nn is None:
-        return float(px), float(py)
-    return float(nn[0]), float(nn[1])
+        return float(px), float(py), float("nan")
+    return float(nn[0]), float(nn[1]), float(nn[2])
 
 
 # ----------------------------
@@ -270,15 +260,8 @@ def find_edges_and_depth(
     min_run: float,
     sample_step: float,
     min_depth_from_bottom: float = 0.3,
-    center_window_m: float = 6.0,
+    center_window_m: float = 6.0
 ):
-    """
-    Same logic as your working PyCharm version (flat edge detection),
-    plus a fallback so you get fewer None rows in real terrain.
-
-    Returns dict:
-      width, depth, bottom_z, edge_z, left_s, right_s, left_edge_z, right_edge_z
-    """
     valid = np.isfinite(zs)
     if valid.sum() < 5:
         return None
@@ -329,47 +312,8 @@ def find_edges_and_depth(
             right_edge_z = m
             break
 
-    # ----- Fallback: if flat not found, use high-percentile edge detection -----
-    if left_center is None or right_center is None or left_edge_z is None or right_edge_z is None:
-        left = zs[:bottom_idx]
-        right = zs[bottom_idx + 1:]
-
-        left = left[np.isfinite(left)]
-        right = right[np.isfinite(right)]
-        if left.size < 5 or right.size < 5:
-            return None
-
-        left_edge_z = float(np.percentile(left, 95))
-        right_edge_z = float(np.percentile(right, 95))
-        edge_z = float((left_edge_z + right_edge_z) / 2.0)
-
-        depth = float(edge_z - bottom_z)
-        if depth <= 0:
-            return None
-
-        thr = edge_z - tol
-        li = np.where(np.isfinite(zs[:bottom_idx]) & (zs[:bottom_idx] >= thr))[0]
-        ri0 = np.where(np.isfinite(zs[bottom_idx:]) & (zs[bottom_idx:] >= thr))[0]
-        if li.size == 0 or ri0.size == 0:
-            return None
-
-        left_center = int(li[-1])
-        right_center = int(bottom_idx + ri0[0])
-
-        width = float(ds[right_center] - ds[left_center])
-        if width <= 0:
-            return None
-
-        return {
-            "width": width,
-            "depth": float(depth),
-            "bottom_z": float(bottom_z),
-            "edge_z": float(edge_z),
-            "left_s": float(ds[left_center]),
-            "right_s": float(ds[right_center]),
-            "left_edge_z": float(left_edge_z),
-            "right_edge_z": float(right_edge_z),
-        }
+    if left_center is None or right_center is None:
+        return None
 
     width = float(ds[right_center] - ds[left_center])
     if width <= 0:
@@ -396,10 +340,6 @@ def find_edges_and_depth(
 # Slope + area
 # ----------------------------
 def parse_slope_ratio(text: str) -> float:
-    """
-    '1:2' -> 2.0 (H/V)
-    or '2' -> 2.0 (H/V)
-    """
     t = text.strip().replace(" ", "")
     if ":" in t:
         a, b = t.split(":", 1)
@@ -479,24 +419,20 @@ def pk_fmt(meters: int) -> str:
 
 
 # ----------------------------
-# PK table computation from LandXML bytes + axis ABS polyline
+# PK table computation
 # ----------------------------
 def compute_pk_table_from_landxml(
     xml_bytes: bytes,
-    axis_xy_abs: List[Tuple[float, float]] | None = None,
-    axis_xy: List[Tuple[float, float]] | None = None,  # alias for older callers
-    pk_step: float = 1.0,
-    cross_len: float = 25.0,
-    sample_step: float = 0.1,
-    tol: float = 0.05,
-    min_run: float = 0.2,
-    min_depth_from_bottom: float = 0.3,
-    slope_text: str = "1:2",
-    bottom_w: float = 0.40,
+    axis_xy_abs: List[Tuple[float, float]],  # ABS (E,N)
+    pk_step: float,
+    cross_len: float,
+    sample_step: float,
+    tol: float,
+    min_run: float,
+    min_depth_from_bottom: float,
+    slope_text: str,
+    bottom_w: float,
 ):
-    if axis_xy_abs is None:
-        axis_xy_abs = axis_xy or []
-
     pts, faces = read_landxml_tin_from_bytes(xml_bytes)
     idx = build_tin_index(pts, faces)
 
@@ -513,7 +449,6 @@ def compute_pk_table_from_landxml(
         s = k * pk_step
         (px, py), (tx, ty) = point_and_tangent_at(axis_xy_abs, s)
 
-        # normal
         nx, ny = -ty, tx
 
         x1 = px - nx * half
@@ -528,7 +463,7 @@ def compute_pk_table_from_landxml(
             min_run=min_run,
             sample_step=sample_step,
             min_depth_from_bottom=min_depth_from_bottom,
-            center_window_m=min(6.0, cross_len / 3.0),
+            center_window_m=min(6.0, cross_len / 3.0)
         )
 
         pk_label = pk_fmt(int(round(s)))
