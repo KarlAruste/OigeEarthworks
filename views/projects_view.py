@@ -260,13 +260,13 @@ def canvas_pick_point(points_local_xy: np.ndarray, axis_local_xy: list[tuple[flo
     }}, '*');
   }}
 
-  canvas.addEventListener('click', (e) => {{
-    // PyCharm style: return exact click position in world coords
-    const [wx, wy] = screenToWorld(e.offsetX, e.offsetY);
-    info.textContent = `Klikk (local): E=${{wx.toFixed(3)}}, N=${{wy.toFixed(3)}}`;
-    sendValue({{picked:true, x:wx, y:wy}});
-  }});
+  canvas.addEventListener('click', (e) => {
+  const [wx, wy] = screenToWorld(e.offsetX, e.offsetY);
+  info.textContent = `Klikk (local): E=${wx.toFixed(3)}, N=${wy.toFixed(3)}`;
+  sendValue(JSON.stringify({picked:true, x:wx, y:wy, t: Date.now()}));
+   });
 
+     
   function setSize() {{
     canvas.style.width = '100%';
     canvas.style.height = '650px';
@@ -298,7 +298,7 @@ def render_projects_view():
     projects = list_projects()
 
     # Session defaults
-    st.session_state.setdefault("active_project_id", None)
+    st.session_state.setdefault("last_pick_id", None)
     st.session_state.setdefault("axis_xy", [])          # ABS [(E,N)]
     st.session_state.setdefault("axis_finished", False)
     st.session_state.setdefault("landxml_bytes", None)
@@ -463,22 +463,44 @@ def render_projects_view():
 
         picked = canvas_pick_point(xyz_show_local, axis_local)
 
-        if picked and isinstance(picked, dict) and picked.get("picked") and (not finished):
-            lx = float(picked.get("x"))
-            ly = float(picked.get("y"))
+# --- normalize picked payload (can arrive as JSON string) ---
+picked_obj = None
+if picked:
+    if isinstance(picked, str):
+        try:
+            picked_obj = json.loads(picked)
+        except Exception:
+            picked_obj = None
+    elif isinstance(picked, dict):
+        picked_obj = picked
 
-            # local -> ABS
-            cx_abs = lx + origin[0]
-            cy_abs = ly + origin[1]
+# --- handle click once (debounce) ---
+if picked_obj and picked_obj.get("picked") and (not finished):
+    # unique click id (timestamp from JS)
+    pick_id = picked_obj.get("t")
+    if pick_id is None:
+        # fallback: hash by coords
+        pick_id = f"{picked_obj.get('x'):.6f}:{picked_obj.get('y'):.6f}"
 
-            if snap_on:
-                sx, sy = snap_xy_to_tin(idx_full, float(cx_abs), float(cy_abs))
-                new_pt = (float(sx), float(sy))
-            else:
-                new_pt = (float(cx_abs), float(cy_abs))
+    if st.session_state.get("last_pick_id") != pick_id:
+        st.session_state["last_pick_id"] = pick_id
 
-            st.session_state["axis_xy"] = axis_xy_abs + [new_pt]
-            st.rerun()
+        lx = float(picked_obj.get("x"))
+        ly = float(picked_obj.get("y"))
+
+        # local -> ABS
+        cx_abs = lx + origin[0]
+        cy_abs = ly + origin[1]
+
+        if snap_on:
+            sx, sy = snap_xy_to_tin(idx_full, float(cx_abs), float(cy_abs))
+            new_pt = (float(sx), float(sy))
+        else:
+            new_pt = (float(cx_abs), float(cy_abs))
+
+        st.session_state["axis_xy"] = axis_xy_abs + [new_pt]
+        st.rerun()
+
 
         if axis_xy_abs:
             L = polyline_length(axis_xy_abs)
