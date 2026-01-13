@@ -1,5 +1,6 @@
 # views/projects_view.py
-# Canvas-põhine telje joonistamine Streamlitis (Renderis töökindel: klikid tulevad alati tagasi)
+# Canvas-põhine telje joonistamine Streamlitis (PyCharm moodi: klikk lisab punkti täpselt klikikohta)
+# + valikuline SNAP TIN-i (checkbox)
 
 import json
 import streamlit as st
@@ -65,13 +66,11 @@ def _abs_to_local(xyz_abs: np.ndarray, origin: tuple[float, float]) -> np.ndarra
 # -------------------------
 
 def canvas_pick_point(points_local_xy: np.ndarray, axis_local_xy: list[tuple[float, float]]):
-    """Interactive HTML5 canvas: pan+zoom with mouse, click selects nearest point.
-
+    """
+    PyCharm-style: click returns the exact world/local coordinate (no nearest point selection).
     Returns dict like:
       {"x": local_x, "y": local_y, "picked": true}
     or None.
-
-    NOTE: We use Streamlit's iframe postMessage protocol to send values back.
     """
     import streamlit.components.v1 as components
 
@@ -97,7 +96,7 @@ def canvas_pick_point(points_local_xy: np.ndarray, axis_local_xy: list[tuple[flo
 <body>
   <div id="wrap">
     <div id="hud">
-      <div><b>Canvas</b> — Pan: lohista | Zoom: rullik | Kliki: vali lähim punkt</div>
+      <div><b>Canvas</b> — Pan: lohista | Zoom: rullik | Kliki: lisa teljele punkt (täpselt kliki kohta)</div>
       <div id="info">—</div>
     </div>
     <canvas id="c"></canvas>
@@ -164,6 +163,7 @@ def canvas_pick_point(points_local_xy: np.ndarray, axis_local_xy: list[tuple[flo
     const h = canvas.clientHeight;
     ctx.clearRect(0,0,w,h);
 
+    // grid
     ctx.save();
     ctx.strokeStyle = '#eef2f6';
     ctx.lineWidth = 1;
@@ -172,6 +172,7 @@ def canvas_pick_point(points_local_xy: np.ndarray, axis_local_xy: list[tuple[flo
     for (let y=0; y<=h; y+=step) {{ ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke(); }}
     ctx.restore();
 
+    // points
     ctx.save();
     ctx.fillStyle = 'rgba(75, 110, 255, 0.85)';
     for (let i=0; i<pts.length; i++) {{
@@ -184,6 +185,7 @@ def canvas_pick_point(points_local_xy: np.ndarray, axis_local_xy: list[tuple[flo
     }}
     ctx.restore();
 
+    // axis polyline
     if (axis && axis.length>0) {{
       ctx.save();
       ctx.strokeStyle = '#f59e0b';
@@ -205,6 +207,7 @@ def canvas_pick_point(points_local_xy: np.ndarray, axis_local_xy: list[tuple[flo
       ctx.restore();
     }}
 
+    // crosshair
     ctx.save();
     ctx.strokeStyle = '#11182733';
     ctx.lineWidth = 1;
@@ -213,6 +216,7 @@ def canvas_pick_point(points_local_xy: np.ndarray, axis_local_xy: list[tuple[flo
     ctx.restore();
   }}
 
+  // interaction
   let dragging=false;
   let lastX=0, lastY=0;
 
@@ -256,25 +260,11 @@ def canvas_pick_point(points_local_xy: np.ndarray, axis_local_xy: list[tuple[flo
     }}, '*');
   }}
 
-  function nearestPoint(wx, wy) {{
-    let best=-1; let bestD=Infinity;
-    for (let i=0; i<pts.length; i++) {{
-      const dx = pts[i][0]-wx;
-      const dy = pts[i][1]-wy;
-      const d = dx*dx + dy*dy;
-      if (d < bestD) {{ bestD=d; best=i; }}
-    }}
-    return best;
-  }}
-
   canvas.addEventListener('click', (e) => {{
+    // PyCharm style: return exact click position in world coords
     const [wx, wy] = screenToWorld(e.offsetX, e.offsetY);
-    const idx = nearestPoint(wx, wy);
-    if (idx < 0) return;
-    const px = pts[idx][0];
-    const py = pts[idx][1];
-    info.textContent = `Valitud (local): E=${{px.toFixed(3)}}, N=${{py.toFixed(3)}}`;
-    sendValue({{picked:true, x:px, y:py}});
+    info.textContent = `Klikk (local): E=${{wx.toFixed(3)}}, N=${{wy.toFixed(3)}}`;
+    sendValue({{picked:true, x:wx, y:wy}});
   }});
 
   function setSize() {{
@@ -294,8 +284,7 @@ def canvas_pick_point(points_local_xy: np.ndarray, axis_local_xy: list[tuple[flo
 </html>
     """
 
-    value = components.html(html, height=670, scrolling=False)
-    return value
+    return components.html(html, height=670, scrolling=False)
 
 
 # -------------------------
@@ -316,7 +305,7 @@ def render_projects_view():
     st.session_state.setdefault("landxml_key", None)
     st.session_state.setdefault("plot_origin", None)    # ABS (E0,N0)
     st.session_state.setdefault("xyz_show_cache", None) # ABS points for display
-    st.session_state.setdefault("tin_index", None)      # full index for snapping
+    st.session_state.setdefault("tin_index", None)      # full index for optional snapping
     st.session_state.setdefault("tin_sig", None)        # invalidation signature
 
     # ---------------- Create project ----------------
@@ -408,7 +397,7 @@ def render_projects_view():
             st.info("Lae LandXML üles, et saaks telge joonistada.")
             return
 
-        # read/cache points + build index once
+        # build index once
         try:
             pts_dict, faces = read_landxml_tin_from_bytes(xml_bytes)
             xyz = np.array(list(pts_dict.values()), dtype=float)
@@ -431,7 +420,7 @@ def render_projects_view():
             st.error(f"LandXML lugemine ebaõnnestus: {e}")
             return
 
-        # buttons
+        # controls
         cA, cB, cC, cD = st.columns([1, 1, 1, 2])
         with cA:
             if st.button("Alusta / joonista telg", use_container_width=True):
@@ -464,10 +453,13 @@ def render_projects_view():
         xyz_show_abs = st.session_state["xyz_show_cache"]
         idx_full = st.session_state["tin_index"]
 
+        # SNAP toggle (PyCharm vs TIN snap)
+        snap_on = st.checkbox("Snap telje punktid TIN-i lähimale tipule (soovi korral)", value=False)
+
         xyz_show_local = _abs_to_local(xyz_show_abs, origin)
         axis_local = [(a - origin[0], b - origin[1]) for (a, b) in axis_xy_abs]
 
-        st.caption("✅ Canvas: kliki kus tahes — lisab teljele lähima TIN punkti (snap päris TIN vastu). Zoom: rullik. Pan: lohista.")
+        st.caption("Canvas: klikk lisab punkti täpselt kliki kohta (PyCharm moodi). Pan: lohista. Zoom: rullik.")
 
         picked = canvas_pick_point(xyz_show_local, axis_local)
 
@@ -475,11 +467,17 @@ def render_projects_view():
             lx = float(picked.get("x"))
             ly = float(picked.get("y"))
 
+            # local -> ABS
             cx_abs = lx + origin[0]
             cy_abs = ly + origin[1]
 
-            sx, sy = snap_xy_to_tin(idx_full, float(cx_abs), float(cy_abs))
-            st.session_state["axis_xy"] = axis_xy_abs + [(float(sx), float(sy))]
+            if snap_on:
+                sx, sy = snap_xy_to_tin(idx_full, float(cx_abs), float(cy_abs))
+                new_pt = (float(sx), float(sy))
+            else:
+                new_pt = (float(cx_abs), float(cy_abs))
+
+            st.session_state["axis_xy"] = axis_xy_abs + [new_pt]
             st.rerun()
 
         if axis_xy_abs:
@@ -507,7 +505,7 @@ def render_projects_view():
             else:
                 res = compute_pk_table_from_landxml(
                     xml_bytes=xml_bytes,
-                    axis_xy_abs=axis_xy_abs,  # FIXED
+                    axis_xy_abs=axis_xy_abs,
                     pk_step=float(pk_step),
                     cross_len=float(cross_len),
                     sample_step=float(sample_step),
@@ -548,18 +546,10 @@ def render_projects_view():
 
                 st.info("Tulemused salvestati projekti planned_* väljade alla (DB).")
 
-        p2 = get_project(pid)
-        if p2 and p2.get("planned_volume_m3") is not None:
-            st.markdown("### Projekti salvestatud planeeritud väärtused")
-            st.write(f"**Planned length:** {float(p2['planned_length_m'] or 0):.2f} m")
-            st.write(f"**Planned area:** {float(p2['planned_area_m2'] or 0):.3f} m²")
-            st.write(f"**Planned volume:** {float(p2['planned_volume_m3'] or 0):.3f} m³")
-
         st.divider()
 
         # ---------------- R2 file upload ----------------
         st.subheader("📤 Failid (Cloudflare R2)")
-
         uploads = st.file_uploader("Laadi üles failid", accept_multiple_files=True, key="proj_files")
         if uploads:
             prefix = project_prefix(p["name"])
