@@ -1,5 +1,6 @@
 import os
 from contextlib import contextmanager
+from datetime import date
 import psycopg
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
