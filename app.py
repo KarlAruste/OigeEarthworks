@@ -10,31 +10,33 @@ st.set_page_config(page_title="Earthworks", layout="wide")
 
 st.markdown("""
 <style>
-.stApp { background-color:#0f1117; color:#e5e7eb; }
-section[data-testid="stSidebar"] { background-color:#141821; border-right:1px solid #1f2937; }
-section[data-testid="stSidebar"] * { color:#e5e7eb; }
-div[role="radiogroup"] > label > div:first-child { display:none; }
-div[role="radiogroup"] label { padding:10px 12px; border-radius:10px; margin-bottom:6px; }
-div[role="radiogroup"] label:hover { background-color:#1b1f2a; }
-div[role="radiogroup"] label:has(input:checked) { background-color:#ff8a00; color:#000; }
-h1,h2,h3 { color:#f9fafb; }
-.block { background:#1b1f2a; border:1px solid #243042; border-radius:14px; padding:16px; }
-.small { color:#9ca3af; font-size:13px; }
-.stButton>button { background-color:#ff8a00; color:#000; border-radius:10px; border:none; }
+.stApp { background-color:#0b0f17; color:#f3f4f6; }
+section[data-testid="stSidebar"] { background-color:#0f1522; border-right:1px solid #1f2937; }
+section[data-testid="stSidebar"] * { color:#f3f4f6 !important; }
+
+h1,h2,h3,h4 { color:#ffffff; }
+p, span, label, div { color:#e5e7eb; }
+
+.block { background:#101827; border:1px solid #223047; border-radius:14px; padding:16px; }
+
+.small, .stCaption, [data-testid="stCaptionContainer"] { color:#cbd5e1 !important; }
+
+.stButton>button {
+  background-color:#ff8a00; color:#000; border-radius:10px; border:none;
+  font-weight:700;
+}
 .stButton>button:hover { background-color:#ffa733; }
 
-/* ---- Tabs readability ---- */
-button[data-baseweb="tab"] {
-  color: #e5e7eb !important;
-  background: transparent !important;
-  border-radius: 10px !important;
-}
+div[role="radiogroup"] > label > div:first-child { display:none; }
+div[role="radiogroup"] label { padding:10px 12px; border-radius:10px; margin-bottom:6px; }
+div[role="radiogroup"] label:hover { background-color:#111c2e; }
+div[role="radiogroup"] label:has(input:checked) { background-color:#ff8a00; color:#000; }
+
+button[data-baseweb="tab"] { color:#e5e7eb !important; }
 button[data-baseweb="tab"][aria-selected="true"] {
-  background: #ff8a00 !important;
-  color: #000 !important;
-}
-div[data-baseweb="tab-list"] {
-  gap: 6px;
+  color:#000 !important;
+  background:#ff8a00 !important;
+  border-radius:10px !important;
 }
 </style>
 """, unsafe_allow_html=True)
