@@ -678,7 +678,7 @@ def compute_pk_table_from_landxml(
             min_run=min_run,
             sample_step=sample_step,
             min_depth_from_bottom=min_depth_from_bottom,
-            center_window_m=min(6.0, cross_len / 3.0)
+            center_window_m=min(6.0, cross_len / 3.0),
             fallback_mode="robust",
         )
 
