@@ -1,22 +1,14 @@
-# db.py
 import os
 from contextlib import contextmanager
-from datetime import date
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import psycopg
 
-
-def _db_url() -> str:
-    url = os.environ.get("DATABASE_URL")
-    if not url:
-        raise RuntimeError("DATABASE_URL missing (Render env var).")
-    # Render sometimes gives postgres://, psycopg2 expects postgresql:// also works, but postgres:// is fine usually.
-    return url
-
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
 @contextmanager
 def get_conn():
-    conn = psycopg2.connect(_db_url(), cursor_factory=RealDictCursor)
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL missing (Render env var).")
+    conn = psycopg.connect(DATABASE_URL)
     try:
         yield conn
     finally:
