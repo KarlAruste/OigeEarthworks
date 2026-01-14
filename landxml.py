@@ -415,16 +415,29 @@ def find_edges_and_depth(
     sample_step: float,
     min_depth_from_bottom: float = 0.3,
     center_window_m: float = 6.0,
+    fallback_mode: str = "robust",   # "none" | "robust"
 ):
+    """
+    Tagastab dict:
+      width, depth, bottom_z, edge_z, left_s, right_s, left_edge_z, right_edge_z, method
+
+    method:
+      - "flat"    -> leiti tasased servad
+      - "robust"  -> fallback (percentile top + min bottom)
+      - None      -> ei õnnestunud
+    """
     valid = np.isfinite(zs)
     if valid.sum() < 5:
         return None
 
     n = len(ds)
     mid = n // 2
+
+    # --- bottom near center window (as before) ---
     halfw = max(2, int((center_window_m / sample_step) / 2))
     i0 = max(0, mid - halfw)
     i1 = min(n, mid + halfw + 1)
+
     if valid[i0:i1].sum() < 3:
         i0, i1 = 0, n
 
@@ -446,6 +459,7 @@ def find_edges_and_depth(
             return False, None
         return True, m
 
+    # --- try FLAT edges (original logic) ---
     left_center = None
     left_edge_z = None
     for end in range(bottom_idx, seg_pts - 1, -1):
@@ -466,28 +480,69 @@ def find_edges_and_depth(
             right_edge_z = m
             break
 
-    if left_center is None or right_center is None:
+    if left_center is not None and right_center is not None and left_edge_z is not None and right_edge_z is not None:
+        width = float(ds[right_center] - ds[left_center])
+        if width <= 0:
+            return None
+        edge_z = float((left_edge_z + right_edge_z) / 2.0)
+        depth = float(edge_z - bottom_z)
+        if depth <= 0:
+            return None
+        return {
+            "width": width,
+            "depth": depth,
+            "bottom_z": bottom_z,
+            "edge_z": edge_z,
+            "left_s": float(ds[left_center]),
+            "right_s": float(ds[right_center]),
+            "left_edge_z": float(left_edge_z),
+            "right_edge_z": float(right_edge_z),
+            "method": "flat",
+        }
+
+    # --- FALLBACK ---
+    if fallback_mode != "robust":
         return None
 
-    width = float(ds[right_center] - ds[left_center])
-    if width <= 0:
+    zsv = zs[np.isfinite(zs)]
+    if zsv.size < 5:
         return None
 
-    edge_z = float((left_edge_z + right_edge_z) / 2.0)
-    depth = float(edge_z - bottom_z)
+    # robust edge level = top percentile (p90)
+    edge_z = float(np.percentile(zsv, 90))
+    bottom_z2 = float(np.min(zsv))
+    depth = float(edge_z - bottom_z2)
     if depth <= 0:
         return None
+
+    # estimate width: span where z is near "edge_z"
+    # threshold: within (tol*2) below edge_z
+    thr = edge_z - max(tol * 2.0, 0.05)
+    idxs = np.where((np.isfinite(zs)) & (zs >= thr))[0]
+    if idxs.size >= 2:
+        left_i = int(idxs[0])
+        right_i = int(idxs[-1])
+        width = float(ds[right_i] - ds[left_i])
+        left_s = float(ds[left_i])
+        right_s = float(ds[right_i])
+    else:
+        # if can't estimate, use full cross length
+        width = float(ds[-1] - ds[0])
+        left_s = float(ds[0])
+        right_s = float(ds[-1])
 
     return {
         "width": width,
         "depth": depth,
-        "bottom_z": bottom_z,
+        "bottom_z": bottom_z2,
         "edge_z": edge_z,
-        "left_s": float(ds[left_center]),
-        "right_s": float(ds[right_center]),
-        "left_edge_z": float(left_edge_z),
-        "right_edge_z": float(right_edge_z),
+        "left_s": left_s,
+        "right_s": right_s,
+        "left_edge_z": edge_z,
+        "right_edge_z": edge_z,
+        "method": "robust",
     }
+
 
 
 # ----------------------------
@@ -624,6 +679,7 @@ def compute_pk_table_from_landxml(
             sample_step=sample_step,
             min_depth_from_bottom=min_depth_from_bottom,
             center_window_m=min(6.0, cross_len / 3.0)
+            fallback_mode="robust",
         )
 
         pk_label = pk_fmt(int(round(s)))
