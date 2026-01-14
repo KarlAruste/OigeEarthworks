@@ -34,9 +34,9 @@ def read_landxml_tin_from_bytes(xml_bytes: bytes) -> Tuple[Dict[int, Tuple[float
     """
     root = ET.fromstring(xml_bytes)
 
+    # --- points ---
     pts: Dict[int, Tuple[float, float, float]] = {}
 
-    # Prefer Definition/Pnts/P
     for p in _iter_by_local(root, "P"):
         pid = p.get("id")
         txt = (p.text or "").strip()
@@ -57,6 +57,7 @@ def read_landxml_tin_from_bytes(xml_bytes: bytes) -> Tuple[Dict[int, Tuple[float
     if not pts:
         raise ValueError("LandXML: ei leidnud <P> punkte (Definition/Pnts/P).")
 
+    # --- faces ---
     faces: List[Tuple[int, int, int]] = []
     for f in _iter_by_local(root, "F"):
         txt = (f.text or "").strip()
@@ -75,13 +76,13 @@ def read_landxml_tin_from_bytes(xml_bytes: bytes) -> Tuple[Dict[int, Tuple[float
         raise ValueError("LandXML: ei leidnud <F> faces (Definition/Faces/F).")
 
     # --- Fix coordinate order ---
-    # Your file: N E Z (Northing ~ 6.5M, Easting ~ 0.6M)
+    # Many Estonian files store N E Z (Northing ~ 6.5M, Easting ~ 0.6M)
     # Output must be E N Z.
-    arr = np.array(list(pts.values()), dtype=float)  # (N?, E?, Z)
+    arr = np.array(list(pts.values()), dtype=float)  # (a,b,z) where a/b could be N/E
     a_med = float(np.median(arr[:, 0]))
     b_med = float(np.median(arr[:, 1]))
-    need_swap = (a_med > 2_000_000.0 and b_med < 2_000_000.0)
 
+    need_swap = (a_med > 2_000_000.0 and b_med < 2_000_000.0)
     if need_swap:
         pts = {pid: (val[1], val[0], val[2]) for pid, val in pts.items()}  # E,N,Z
 
@@ -129,9 +130,11 @@ class TinIndex:
     pts_xyz: np.ndarray       # (N,3) full cloud (E,N,Z)
 
 
-def build_tin_index(pts: Dict[int, Tuple[float, float, float]],
-                    faces: List[Tuple[int, int, int]],
-                    target_bucket_count: int = 150_000) -> TinIndex:
+def build_tin_index(
+    pts: Dict[int, Tuple[float, float, float]],
+    faces: List[Tuple[int, int, int]],
+    target_bucket_count: int = 150_000
+) -> TinIndex:
     tris = np.empty((len(faces), 3, 3), dtype=float)
     for i, (a, b, c) in enumerate(faces):
         tris[i, 0, :] = pts[a]
@@ -165,9 +168,11 @@ def build_tin_index(pts: Dict[int, Tuple[float, float, float]],
         iy = int((y - miny) // cell)
         pt_buckets.setdefault((ix, iy), []).append((float(x), float(y), float(z)))
 
-    return TinIndex(tris=tris, minx=minx, miny=miny, cell=cell,
-                    tri_buckets=tri_buckets, pt_buckets=pt_buckets,
-                    pts_xyz=pts_xyz)
+    return TinIndex(
+        tris=tris, minx=minx, miny=miny, cell=cell,
+        tri_buckets=tri_buckets, pt_buckets=pt_buckets,
+        pts_xyz=pts_xyz
+    )
 
 
 def nearest_point_xyz(idx: TinIndex, px: float, py: float, max_rings: int = 8) -> Optional[Tuple[float, float, float]]:
@@ -222,8 +227,8 @@ def z_at_xy(idx: TinIndex, px: float, py: float) -> Optional[float]:
 def snap_xy_to_tin(idx: TinIndex, px: float, py: float) -> Tuple[float, float, float]:
     nn = nearest_point_xyz(idx, px, py, max_rings=10)
     if nn is None:
-        return px, py, float("nan")
-    return float(nn[0]), float(nn[1]), float(nn[2])
+        return (float(px), float(py), float("nan"))
+    return (float(nn[0]), float(nn[1]), float(nn[2]))
 
 
 # ----------------------------
@@ -247,10 +252,15 @@ def sample_profile(idx: TinIndex, x1, y1, x2, y2, step) -> Tuple[np.ndarray, np.
     return ds, zs
 
 
-def find_edges_and_depth(ds: np.ndarray, zs: np.ndarray,
-                         tol: float, min_run: float, sample_step: float,
-                         min_depth_from_bottom: float = 0.3,
-                         center_window_m: float = 6.0):
+def find_edges_and_depth(
+    ds: np.ndarray,
+    zs: np.ndarray,
+    tol: float,
+    min_run: float,
+    sample_step: float,
+    min_depth_from_bottom: float = 0.3,
+    center_window_m: float = 6.0
+):
     valid = np.isfinite(zs)
     if valid.sum() < 5:
         return None
@@ -329,7 +339,13 @@ def find_edges_and_depth(ds: np.ndarray, zs: np.ndarray,
 # Slope + area
 # ----------------------------
 def parse_slope_ratio(text: str) -> float:
-    t = text.strip().replace(" ", "")
+    """
+    '1:2' -> 2.0 (H/V)
+    or '2' -> 2.0
+    """
+    t = (text or "").strip().replace(" ", "")
+    if not t:
+        return 2.0
     if ":" in t:
         a, b = t.split(":", 1)
         v = float(a)
@@ -346,7 +362,7 @@ def area_trapezoid(bottom_w: float, depth: float, slope_h_over_v: float) -> floa
 
 
 # ----------------------------
-# Polyline helpers (ABS coords!)
+# Polyline helpers (ABS coords! E,N)
 # ----------------------------
 def polyline_cumlen(xy: List[Tuple[float, float]]) -> np.ndarray:
     cum = [0.0]
@@ -408,131 +424,30 @@ def pk_fmt(meters: int) -> str:
 
 
 # ----------------------------
-# Axis import helpers
-# ----------------------------
-def read_axis_polyline_from_csv_bytes(data: bytes) -> List[Tuple[float, float]]:
-    """
-    Accepts CSV/TXT exported from Civil3D:
-      - delimiter: ; or , or whitespace
-      - columns: E N  (or X Y)
-      - may have header row
-    Returns: [(E,N), ...]
-    """
-    text = data.decode("utf-8", errors="ignore")
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    if not lines:
-        raise ValueError("Teljefail: tühi.")
-
-    # detect delimiter
-    sample = lines[0]
-    if ";" in sample:
-        delim = ";"
-    elif "," in sample:
-        delim = ","
-    else:
-        delim = None
-
-    pts = []
-    for ln in lines:
-        # skip obvious headers
-        low = ln.lower()
-        if any(k in low for k in ["e", "n", "x", "y"]) and any(c.isalpha() for c in low) and not any(ch.isdigit() for ch in low):
-            continue
-
-        if delim:
-            parts = [p.strip() for p in ln.split(delim) if p.strip()]
-        else:
-            parts = ln.replace(",", " ").split()
-
-        if len(parts) < 2:
-            continue
-
-        try:
-            a = float(parts[0])
-            b = float(parts[1])
-            pts.append((a, b))
-        except Exception:
-            continue
-
-    if len(pts) < 2:
-        raise ValueError("Teljefail: ei saanud vähemalt 2 punkti (kontrolli veerge E;N).")
-    return pts
-
-
-def read_axis_from_landxml_alignment_bytes(xml_bytes: bytes) -> List[Tuple[float, float]]:
-    """
-    Very pragmatic LandXML alignment polyline extraction.
-    Reads CoordGeom segments in order:
-      - Line: Start/End
-      - Curve: Start/End
-    Returns polyline [(E,N),...]
-    """
-    root = ET.fromstring(xml_bytes)
-
-    def _read_xy(el) -> Optional[Tuple[float, float]]:
-        if el is None:
-            return None
-        txt = (el.text or "").strip().replace(",", " ")
-        parts = txt.split()
-        if len(parts) < 2:
-            return None
-        try:
-            x = float(parts[0])
-            y = float(parts[1])
-            return (x, y)
-        except Exception:
-            return None
-
-    # find first Alignment CoordGeom
-    coordgeom = None
-    for el in root.iter():
-        if _strip(el.tag).lower() == "coordgeom":
-            coordgeom = el
-            break
-    if coordgeom is None:
-        raise ValueError("Alignment LandXML: ei leidnud <CoordGeom>.")
-
-    pts: List[Tuple[float, float]] = []
-
-    for seg in list(coordgeom):
-        name = _strip(seg.tag).lower()
-        if name in ("line", "curve", "spiral"):
-            st_el = None
-            en_el = None
-            for ch in seg:
-                ln = _strip(ch.tag).lower()
-                if ln == "start":
-                    st_el = ch
-                elif ln == "end":
-                    en_el = ch
-            st_xy = _read_xy(st_el)
-            en_xy = _read_xy(en_el)
-
-            if st_xy and (len(pts) == 0 or (abs(pts[-1][0] - st_xy[0]) > 1e-9 or abs(pts[-1][1] - st_xy[1]) > 1e-9)):
-                pts.append(st_xy)
-            if en_xy:
-                pts.append(en_xy)
-
-    if len(pts) < 2:
-        raise ValueError("Alignment LandXML: ei saanud teljepunkte kätte (Line/Curve Start/End).")
-    return pts
-
-
-# ----------------------------
-# PK table computation from LandXML bytes + axis ABS polyline
+# PK table computation
+# Backward compatible:
+#   - axis_xy_abs (preferred)
+#   - axis_xy (older)
 # ----------------------------
 def compute_pk_table_from_landxml(
     xml_bytes: bytes,
-    axis_xy_abs: List[Tuple[float, float]],  # ABS (E,N)
-    pk_step: float,
-    cross_len: float,
-    sample_step: float,
-    tol: float,
-    min_run: float,
-    min_depth_from_bottom: float,
-    slope_text: str,
-    bottom_w: float,
+    axis_xy_abs: Optional[List[Tuple[float, float]]] = None,
+    pk_step: float = 1.0,
+    cross_len: float = 25.0,
+    sample_step: float = 0.1,
+    tol: float = 0.05,
+    min_run: float = 0.2,
+    min_depth_from_bottom: float = 0.3,
+    slope_text: str = "1:2",
+    bottom_w: float = 0.40,
+    **kwargs,
 ):
+    # accept axis_xy as alias
+    if axis_xy_abs is None:
+        axis_xy_abs = kwargs.get("axis_xy")
+    if not axis_xy_abs or len(axis_xy_abs) < 2:
+        raise ValueError("Telg puudub või liiga lühike (vähemalt 2 punkti).")
+
     pts, faces = read_landxml_tin_from_bytes(xml_bytes)
     idx = build_tin_index(pts, faces)
 
@@ -549,6 +464,7 @@ def compute_pk_table_from_landxml(
         s = k * pk_step
         (px, py), (tx, ty) = point_and_tangent_at(axis_xy_abs, s)
 
+        # normal
         nx, ny = -ty, tx
 
         x1 = px - nx * half
@@ -563,7 +479,7 @@ def compute_pk_table_from_landxml(
             min_run=min_run,
             sample_step=sample_step,
             min_depth_from_bottom=min_depth_from_bottom,
-            center_window_m=min(6.0, cross_len / 3.0)
+            center_window_m=min(6.0, cross_len / 3.0),
         )
 
         pk_label = pk_fmt(int(round(s)))
@@ -580,6 +496,7 @@ def compute_pk_table_from_landxml(
             })
             continue
 
+        width = float(info["width"])
         depth = float(info["depth"])
         edge_z = float(info["edge_z"])
         bottom_z = float(info["bottom_z"])
@@ -591,7 +508,7 @@ def compute_pk_table_from_landxml(
 
         rows.append({
             "PK": pk_label,
-            "Width_m": float(info["width"]),
+            "Width_m": width,
             "Depth_m": depth,
             "EdgeZ": edge_z,
             "BottomZ": bottom_z,
