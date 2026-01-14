@@ -4,7 +4,7 @@ from views.projects_view import render_projects_view
 from views.workers_view import render_workers_view
 from views.tasks_view import render_tasks_view
 from views.reports_view import render_reports_view
-from views.machines_view import render_machines_view  # uus
+from views.machines_view import render_machines_view
 
 st.set_page_config(page_title="Earthworks", layout="wide")
 
@@ -19,15 +19,23 @@ div[role="radiogroup"] label:hover { background-color:#1b1f2a; }
 div[role="radiogroup"] label:has(input:checked) { background-color:#ff8a00; color:#000; }
 h1,h2,h3 { color:#f9fafb; }
 .block { background:#1b1f2a; border:1px solid #243042; border-radius:14px; padding:16px; }
-.small { color:#cbd5e1; font-size:13px; }
+.small { color:#9ca3af; font-size:13px; }
 .stButton>button { background-color:#ff8a00; color:#000; border-radius:10px; border:none; }
 .stButton>button:hover { background-color:#ffa733; }
 
-/* Make tab labels readable in dark mode */
-div[data-testid="stTabs"] button[role="tab"] p { color:#e5e7eb !important; font-weight:600; }
-div[data-testid="stTabs"] button[role="tab"][aria-selected="true"] p { color:#000 !important; }
-div[data-testid="stTabs"] button[role="tab"][aria-selected="true"] { background:#ff8a00 !important; border-radius:10px !important; }
-div[data-testid="stTabs"] button[role="tab"] { background:#1b1f2a !important; border-radius:10px !important; margin-right:6px !important; }
+/* ---- Tabs readability ---- */
+button[data-baseweb="tab"] {
+  color: #e5e7eb !important;
+  background: transparent !important;
+  border-radius: 10px !important;
+}
+button[data-baseweb="tab"][aria-selected="true"] {
+  background: #ff8a00 !important;
+  color: #000 !important;
+}
+div[data-baseweb="tab-list"] {
+  gap: 6px;
+}
 </style>
 """, unsafe_allow_html=True)
 
