@@ -1,13 +1,15 @@
 # views/projects_view.py
 import streamlit as st
 from datetime import date
-import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 
-from streamlit_plotly_events import plotly_events
+from db import (
+    list_projects,
+    create_project,
+    get_project,
+    set_project_landxml,
+)
 
-from db import list_projects, create_project, get_project, set_project_landxml
 from r2 import (
     get_s3,
     project_prefix,
@@ -17,142 +19,56 @@ from r2 import (
     list_files,
     delete_key,
 )
+
 from landxml import (
-    read_landxml_tin_from_bytes,
-    build_tin_index,
-    snap_xy_to_tin,
-    polyline_length,
     compute_pk_table_from_landxml,
+    read_axis_polyline_from_csv_bytes,
+    read_axis_from_landxml_alignment_bytes,
+    polyline_length,
 )
 
 
-def _downsample(xy: np.ndarray, max_pts: int = 60000) -> np.ndarray:
-    if xy is None or xy.size == 0:
-        return xy
-    n = xy.shape[0]
-    if n <= max_pts:
-        return xy
-    idx = np.random.choice(n, size=max_pts, replace=False)
-    return xy[idx]
+def _list_landxml_keys_for_project(s3, proj_name: str):
+    prefix = project_prefix(proj_name) + "landxml/"
+    files = list_files(s3, prefix)
+    # keep only xml/landxml
+    out = []
+    for f in files:
+        n = (f.get("name") or "").lower()
+        if n.endswith(".xml") or n.endswith(".landxml"):
+            out.append(f)
+    # newest first if list_files returns that way; if not, it’s ok.
+    return out
 
 
-def _finite_xy(xy: np.ndarray) -> np.ndarray:
-    """Keep only finite X,Y rows."""
-    if xy is None or xy.size == 0:
-        return xy
-    m = np.isfinite(xy[:, 0]) & np.isfinite(xy[:, 1])
-    return xy[m]
-
-
-def _make_fig(points_local: np.ndarray, axis_local: list, uirev: str):
-    fig = go.Figure()
-
-    if points_local is None or points_local.size == 0:
-        fig.update_layout(
-            height=650,
-            title="TIN punkte ei ole (või kõik olid NaN/Inf). Kontrolli LandXML-i.",
-            margin=dict(l=10, r=10, t=40, b=10),
-        )
-        return fig
-
-    # robust bounds
-    xmin = float(np.nanmin(points_local[:, 0]))
-    xmax = float(np.nanmax(points_local[:, 0]))
-    ymin = float(np.nanmin(points_local[:, 1]))
-    ymax = float(np.nanmax(points_local[:, 1]))
-
-    if not np.isfinite([xmin, xmax, ymin, ymax]).all():
-        fig.update_layout(
-            height=650,
-            title="TIN punktide piirid (min/max) olid NaN/Inf – kontrolli andmeid.",
-            margin=dict(l=10, r=10, t=40, b=10),
-        )
-        return fig
-
-    dx = (xmax - xmin) if xmax > xmin else 1.0
-    dy = (ymax - ymin) if ymax > ymin else 1.0
-    pad_x = dx * 0.08
-    pad_y = dy * 0.08
-
-    # Points
-    fig.add_trace(
-        go.Scattergl(
-            x=points_local[:, 0].astype(float),
-            y=points_local[:, 1].astype(float),
-            mode="markers",
-            marker=dict(size=3, opacity=0.75),
-            name="TIN punktid",
-            hoverinfo="skip",
-            showlegend=False,
-        )
-    )
-
-    # Axis polyline
-    if axis_local and len(axis_local) >= 1:
-        xs = [p[0] for p in axis_local]
-        ys = [p[1] for p in axis_local]
-        fig.add_trace(
-            go.Scatter(
-                x=xs,
-                y=ys,
-                mode="lines+markers",
-                line=dict(width=4),
-                marker=dict(size=10),
-                name="Telg",
-            )
-        )
-
-    fig.update_layout(
-        height=650,
-        title="Pealtvaade (kohalikud koordinaadid) – kliki telje punktide lisamiseks",
-        margin=dict(l=10, r=10, t=40, b=10),
-        dragmode="pan",
-        uirevision=uirev,  # hoiab zoom/pan alles rerunil
-    )
-
-    fig.update_xaxes(
-        title="E (local, m)",
-        range=[xmin - pad_x, xmax + pad_x],
-        tickformat=".0f",
-        zeroline=False,
-    )
-    fig.update_yaxes(
-        title="N (local, m)",
-        range=[ymin - pad_y, ymax + pad_y],
-        tickformat=".0f",
-        scaleanchor="x",
-        scaleratio=1,
-        zeroline=False,
-    )
-
-    return fig
+def _axis_from_uploaded_file(file_name: str, data: bytes):
+    low = (file_name or "").lower()
+    if low.endswith(".csv") or low.endswith(".txt"):
+        return read_axis_polyline_from_csv_bytes(data)
+    if low.endswith(".xml") or low.endswith(".landxml"):
+        # treat as Alignment LandXML
+        return read_axis_from_landxml_alignment_bytes(data)
+    raise ValueError("Telg: toeta ainult .csv/.txt (punktid E;N) või .xml/.landxml (Alignment).")
 
 
 def render_projects_view():
     st.title("Projects")
+
     s3 = get_s3()
     projects = list_projects()
 
-    # ---------------- session state ----------------
+    # Session defaults
     st.session_state.setdefault("active_project_id", None)
 
-    st.session_state.setdefault("landxml_bytes", None)
-    st.session_state.setdefault("landxml_key", None)
-
-    st.session_state.setdefault("tin_index", None)    # TinIndex
-    st.session_state.setdefault("origin_EN", None)    # (E0,N0)
-
-    st.session_state.setdefault("axis_abs", [])       # ABS [(E,N)]
-    st.session_state.setdefault("axis_finished", False)
-    st.session_state.setdefault("axis_drawing", False)
-
-    st.session_state.setdefault("plot_uirev", "init")
-    st.session_state.setdefault("last_click_sig", None)
-
-    debug = st.checkbox("DEBUG", value=False)
+    # Mahud tab state
+    st.session_state.setdefault("selected_landxml_key", None)
+    st.session_state.setdefault("axis_points_abs", None)  # [(E,N)]
+    st.session_state.setdefault("axis_name", None)
 
     # ---------------- Create project ----------------
+    st.markdown('<div class="block">', unsafe_allow_html=True)
     st.subheader("➕ Loo projekt")
+
     c1, c2, c3 = st.columns([2, 1, 1])
     with c1:
         name = st.text_input("Projekti nimi", placeholder="nt Objekt_01")
@@ -170,7 +86,7 @@ def render_projects_view():
             st.success("Projekt loodud.")
             st.rerun()
 
-    st.divider()
+    st.markdown("</div>", unsafe_allow_html=True)
 
     # ---------------- Project list ----------------
     st.subheader("📌 Minu projektid")
@@ -186,18 +102,11 @@ def render_projects_view():
             if st.button(proj["name"], use_container_width=True, key=f"projbtn_{proj['id']}"):
                 st.session_state["active_project_id"] = proj["id"]
 
-                # reset
-                st.session_state["landxml_bytes"] = None
-                st.session_state["landxml_key"] = None
-                st.session_state["tin_index"] = None
-                st.session_state["origin_EN"] = None
+                # reset per project
+                st.session_state["selected_landxml_key"] = proj.get("landxml_key") or None
+                st.session_state["axis_points_abs"] = None
+                st.session_state["axis_name"] = None
 
-                st.session_state["axis_abs"] = []
-                st.session_state["axis_finished"] = False
-                st.session_state["axis_drawing"] = False
-
-                st.session_state["plot_uirev"] = f"init-{proj['id']}"
-                st.session_state["last_click_sig"] = None
                 st.rerun()
 
     with right:
@@ -214,262 +123,222 @@ def render_projects_view():
         st.subheader(p["name"])
         st.caption(f"Tähtaeg: {p.get('end_date')}")
 
-        # ---------------- LandXML upload ----------------
-        st.markdown("### 📄 LandXML")
-        landxml = st.file_uploader(
-            "Laadi üles LandXML (.xml/.landxml)",
-            type=["xml", "landxml"],
-            key="landxml_upload",
-        )
+        tab_general, tab_volumes, tab_files = st.tabs(["Üldine", "Mahud", "Failid"])
 
-        if landxml and st.button("Salvesta LandXML (R2) & lae mudel", use_container_width=True):
-            prefix = project_prefix(p["name"]) + "landxml/"
-            key = upload_file(s3, prefix, landxml)
-            xml_bytes = download_bytes(s3, key)
+        # =========================
+        # ÜLDINE
+        # =========================
+        with tab_general:
+            st.markdown('<div class="block">', unsafe_allow_html=True)
+            st.subheader("ℹ️ Projekti info")
 
-            pts, faces = read_landxml_tin_from_bytes(xml_bytes)
-            idx = build_tin_index(pts, faces)
+            st.write(f"**Projekt:** {p['name']}")
+            st.write(f"**Algus:** {p.get('start_date')}")
+            st.write(f"**Tähtaeg:** {p.get('end_date')}")
 
-            xyz = idx.pts_xyz  # (E,N,Z)
+            if p.get("planned_volume_m3") is not None:
+                st.markdown("### Salvestatud planeeritud väärtused (viimane arvutus)")
+                st.write(f"**Planned length:** {float(p.get('planned_length_m') or 0):.2f} m")
+                st.write(f"**Planned area:** {float(p.get('planned_area_m2') or 0):.3f} m²")
+                st.write(f"**Planned volume:** {float(p.get('planned_volume_m3') or 0):.3f} m³")
 
-            # filter finite (E,N)
-            xy_abs = np.column_stack([xyz[:, 0], xyz[:, 1]])
-            xy_abs = _finite_xy(xy_abs)
+            st.markdown("</div>", unsafe_allow_html=True)
 
-            if xy_abs is None or xy_abs.size == 0:
-                st.error("LandXML-ist tuli 0 finite (E,N) punkti. Kontrolli LandXML koordinaate.")
+        # =========================
+        # MAHUD (LandXML + axis upload + compute)
+        # =========================
+        with tab_volumes:
+            st.markdown('<div class="block">', unsafe_allow_html=True)
+            st.subheader("📐 Mahud (LandXML + telg)")
+
+            # ---- 1) LANDXML: upload + select existing ----
+            st.markdown("#### 1) Vali pinnamudel (LandXML)")
+
+            landxml_files = _list_landxml_keys_for_project(s3, p["name"])
+            options = []
+            key_by_label = {}
+
+            # show existing in R2
+            for f in landxml_files:
+                label = f"{f['name']}  ({f['size']/1024:.1f} KB)"
+                options.append(label)
+                key_by_label[label] = f["key"]
+
+            # include DB-saved key if not listed for some reason
+            if p.get("landxml_key") and p["landxml_key"] not in (x["key"] for x in landxml_files):
+                label = f"{p['landxml_key'].split('/')[-1]}  (DB)"
+                options.insert(0, label)
+                key_by_label[label] = p["landxml_key"]
+
+            selected_label = None
+            if options:
+                # try set default
+                default_key = st.session_state.get("selected_landxml_key") or p.get("landxml_key")
+                default_idx = 0
+                if default_key:
+                    for i, lab in enumerate(options):
+                        if key_by_label.get(lab) == default_key:
+                            default_idx = i
+                            break
+                selected_label = st.selectbox("Üleslaetud pinnamudelid", options, index=default_idx)
+                st.session_state["selected_landxml_key"] = key_by_label[selected_label]
+
+            # upload new landxml
+            new_landxml = st.file_uploader("Laadi uus LandXML (.xml/.landxml)", type=["xml", "landxml"], key="landxml_upload_volumes")
+            if new_landxml and st.button("Salvesta LandXML R2-sse", use_container_width=True):
+                prefix = project_prefix(p["name"]) + "landxml/"
+                key = upload_file(s3, prefix, new_landxml)
+                st.session_state["selected_landxml_key"] = key
+                st.success("LandXML salvestatud. Vali see listist ja arvuta.")
+                st.rerun()
+
+            landxml_key = st.session_state.get("selected_landxml_key")
+            if not landxml_key:
+                st.info("Vali või lae LandXML pinnamudel.")
+                st.markdown("</div>", unsafe_allow_html=True)
                 return
 
-            E0 = float(np.median(xy_abs[:, 0]))
-            N0 = float(np.median(xy_abs[:, 1]))
+            # ---- 2) AXIS: upload polyline/alignment ----
+            st.markdown("#### 2) Telg (Civil3D polyline / alignment)")
 
-            st.session_state["landxml_bytes"] = xml_bytes
-            st.session_state["landxml_key"] = key
-            st.session_state["tin_index"] = idx
-            st.session_state["origin_EN"] = (E0, N0)
-
-            st.session_state["axis_abs"] = []
-            st.session_state["axis_finished"] = False
-            st.session_state["axis_drawing"] = False
-            st.session_state["last_click_sig"] = None
-            st.session_state["plot_uirev"] = f"model-{pid}-{key}"
-
-            st.success(f"LandXML laetud. Punkte: {xyz.shape[0]:,} | Faces: {idx.tris.shape[0]:,}")
-            st.rerun()
-
-        if not st.session_state["tin_index"]:
-            st.info("Lae LandXML, et näha punkte ja joonistada telg.")
-            return
-
-        idx = st.session_state["tin_index"]
-        E0, N0 = st.session_state["origin_EN"]
-
-        xyz = idx.pts_xyz
-        xy_abs_full = np.column_stack([xyz[:, 0], xyz[:, 1]])
-        xy_abs_full = _finite_xy(xy_abs_full)
-
-        if xy_abs_full is None or xy_abs_full.size == 0:
-            st.error("TIN punktid on olemas, aga kõik (E,N) olid NaN/Inf. Ei saa joonistada.")
-            return
-
-        # local coords
-        xy_local = np.column_stack([xy_abs_full[:, 0] - E0, xy_abs_full[:, 1] - N0])
-        xy_local = _finite_xy(xy_local)
-        xy_local_show = _downsample(xy_local, max_pts=60000)
-
-        # show stats (this will tell immediately if we have data)
-        st.caption(f"Punkte (finite E,N): {xy_abs_full.shape[0]:,} | Kuvan: {xy_local_show.shape[0]:,}")
-        if debug:
-            st.write(
-                "DEBUG local min/max:",
-                float(np.min(xy_local_show[:, 0])),
-                float(np.max(xy_local_show[:, 0])),
-                float(np.min(xy_local_show[:, 1])),
-                float(np.max(xy_local_show[:, 1])),
+            st.caption(
+                "Soovitus: ekspordi Civil3D-st telje punktid CSV-ks (E;N igal real). "
+                "Või ekspordi alignment LandXML-ina (CoordGeom Line/Curve Start/End)."
             )
 
-        axis_abs = st.session_state["axis_abs"]
-        axis_local = [(E - E0, N - N0) for (E, N) in axis_abs]
+            axis_file = st.file_uploader(
+                "Laadi teljefail (.csv/.txt punktidega või alignment .xml/.landxml)",
+                type=["csv", "txt", "xml", "landxml"],
+                key="axis_upload",
+            )
 
-        # ---------------- Axis UI ----------------
-        st.markdown("### 🧭 Telje joonistamine (kliki pildil)")
-        cA, cB, cC, cD = st.columns([1, 1, 1, 2])
-
-        with cA:
-            if st.button("Alusta / joonista telg", use_container_width=True):
-                st.session_state["axis_abs"] = []
-                st.session_state["axis_finished"] = False
-                st.session_state["axis_drawing"] = True
-                st.session_state["last_click_sig"] = None
+            if axis_file and st.button("Impordi telg", use_container_width=True):
+                data = axis_file.getvalue()
+                axis_pts = _axis_from_uploaded_file(axis_file.name, data)
+                st.session_state["axis_points_abs"] = axis_pts
+                st.session_state["axis_name"] = axis_file.name
+                st.success(f"Telg imporditud: {len(axis_pts)} punkti, pikkus {polyline_length(axis_pts):.2f} m")
                 st.rerun()
 
-        with cB:
-            if st.button("Undo", use_container_width=True):
-                if st.session_state["axis_abs"]:
-                    st.session_state["axis_abs"] = st.session_state["axis_abs"][:-1]
-                    st.session_state["axis_finished"] = False
-                    st.rerun()
-
-        with cC:
-            if st.button("Tühjenda telg", use_container_width=True):
-                st.session_state["axis_abs"] = []
-                st.session_state["axis_finished"] = False
-                st.session_state["axis_drawing"] = True
-                st.session_state["last_click_sig"] = None
-                st.rerun()
-
-        with cD:
-            if st.button("Lõpeta telg", use_container_width=True):
-                if len(st.session_state["axis_abs"]) < 2:
-                    st.warning("Telg peab olema vähemalt 2 punktiga.")
-                else:
-                    st.session_state["axis_finished"] = True
-                    st.session_state["axis_drawing"] = False
-                    st.success("Telg lõpetatud.")
-                    st.rerun()
-
-        drawing = st.session_state["axis_drawing"]
-        finished = st.session_state["axis_finished"]
-
-        snap_on = st.checkbox("Snap telje punktid TIN-i lähimale tipule", value=True)
-        st.write(f"Telje režiim: {'✅ ON' if drawing else '❌ OFF'} | Telg lõpetatud: {finished}")
-
-        # ---------------- Plot + click capture ----------------
-        fig = _make_fig(
-            points_local=xy_local_show,
-            axis_local=axis_local,
-            uirev=st.session_state["plot_uirev"],
-        )
-
-        click_data = plotly_events(
-            fig,
-            click_event=True,
-            select_event=False,
-            hover_event=False,
-            override_height=650,
-            key="tin_plot_events",
-        )
-
-        if debug:
-            st.write("DEBUG click_data:", click_data)
-
-        if drawing and (not finished) and click_data:
-            x_local = float(click_data[0]["x"])
-            y_local = float(click_data[0]["y"])
-
-            sig = f"{x_local:.4f}:{y_local:.4f}"
-            if st.session_state.get("last_click_sig") != sig:
-                st.session_state["last_click_sig"] = sig
-
-                E_click = x_local + E0
-                N_click = y_local + N0
-
-                if snap_on:
-                    E_snap, N_snap, _Z = snap_xy_to_tin(idx, E_click, N_click)
-                    st.session_state["axis_abs"] = st.session_state["axis_abs"] + [(float(E_snap), float(N_snap))]
-                else:
-                    st.session_state["axis_abs"] = st.session_state["axis_abs"] + [(float(E_click), float(N_click))]
-
-                st.rerun()
-
-        if st.session_state["axis_abs"]:
-            L = polyline_length(st.session_state["axis_abs"])
-            st.write(f"**Telje pikkus:** {L:.2f} m | Punkte: {len(st.session_state['axis_abs'])}")
-
-        # ---------------- PK parameters + compute ----------------
-        st.markdown("### Arvutusparameetrid")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            pk_step = st.number_input("PK samm (m)", min_value=0.1, value=1.0, step=0.1)
-            cross_len = st.number_input("Ristlõike kogupikkus (m)", min_value=2.0, value=25.0, step=1.0)
-            sample_step = st.number_input("Proovipunkti samm (m)", min_value=0.02, value=0.1, step=0.01)
-        with c2:
-            tol = st.number_input("Tasase tolerants (m)", min_value=0.001, value=0.05, step=0.005)
-            min_run = st.number_input("Min tasane lõik (m)", min_value=0.05, value=0.2, step=0.05)
-            min_depth = st.number_input("Min kõrgus põhjast (m)", min_value=0.0, value=0.3, step=0.05)
-        with c3:
-            slope = st.text_input("Nõlva kalle (nt 1:2)", value="1:2")
-            bottom_w = st.number_input("Põhja laius b (m)", min_value=0.0, value=0.40, step=0.05)
-
-        if st.button("Arvuta PK tabel (telje järgi)", use_container_width=True):
-            if len(st.session_state["axis_abs"]) < 2:
-                st.warning("Joonista telg enne arvutamist.")
+            axis_pts = st.session_state.get("axis_points_abs")
+            if axis_pts:
+                st.write(f"**Telg:** {st.session_state.get('axis_name')} | Punkte: {len(axis_pts)} | Pikkus: {polyline_length(axis_pts):.2f} m")
+                with st.expander("Näita telje esimesed 10 punkti"):
+                    df_axis = pd.DataFrame(axis_pts[:10], columns=["E", "N"])
+                    st.dataframe(df_axis, use_container_width=True)
             else:
-                res = compute_pk_table_from_landxml(
-                    xml_bytes=st.session_state["landxml_bytes"],
-                    axis_xy_abs=st.session_state["axis_abs"],
-                    pk_step=float(pk_step),
-                    cross_len=float(cross_len),
-                    sample_step=float(sample_step),
-                    tol=float(tol),
-                    min_run=float(min_run),
-                    min_depth_from_bottom=float(min_depth),
-                    slope_text=str(slope),
-                    bottom_w=float(bottom_w),
-                )
+                st.warning("Impordi telg enne arvutamist.")
 
-                df = pd.DataFrame(res["rows"])
-                st.success(f"✅ Kokku maht: {res['total_volume_m3']:.3f} m³")
-                st.write(f"Telje pikkus: **{res['axis_length_m']:.2f} m** | PK-sid: **{res['count']}**")
+            # ---- 3) Compute parameters ----
+            st.markdown("#### 3) Arvutusparameetrid")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                pk_step = st.number_input("PK samm (m)", min_value=0.1, value=1.0, step=0.1)
+                cross_len = st.number_input("Ristlõike kogupikkus (m)", min_value=2.0, value=25.0, step=1.0)
+                sample_step = st.number_input("Proovipunkti samm (m)", min_value=0.02, value=0.1, step=0.01)
+            with c2:
+                tol = st.number_input("Tasase tolerants (m)", min_value=0.001, value=0.05, step=0.005)
+                min_run = st.number_input("Min tasane lõik (m)", min_value=0.05, value=0.2, step=0.05)
+                min_depth = st.number_input("Min kõrgus põhjast (m)", min_value=0.0, value=0.3, step=0.05)
+            with c3:
+                slope = st.text_input("Nõlva kalle (nt 1:2)", value="1:2")
+                bottom_w = st.number_input("Põhja laius b (m)", min_value=0.0, value=0.40, step=0.05)
 
-                planned_area = None
-                if res["axis_length_m"] and res["axis_length_m"] > 0 and res["total_volume_m3"] is not None:
-                    planned_area = float(res["total_volume_m3"] / res["axis_length_m"])
+            # ---- 4) Compute ----
+            if st.button("Arvuta PK tabel (LandXML + telg)", use_container_width=True):
+                if not axis_pts or len(axis_pts) < 2:
+                    st.error("Telg puudub või liiga lühike.")
+                else:
+                    xml_bytes = download_bytes(s3, landxml_key)
 
-                key = st.session_state["landxml_key"] or p.get("landxml_key") or ""
-                set_project_landxml(
-                    p["id"],
-                    landxml_key=key,
-                    planned_volume_m3=float(res["total_volume_m3"]),
-                    planned_length_m=float(res["axis_length_m"]),
-                    planned_area_m2=planned_area,
-                )
+                    res = compute_pk_table_from_landxml(
+                        xml_bytes=xml_bytes,
+                        axis_xy_abs=axis_pts,
+                        pk_step=float(pk_step),
+                        cross_len=float(cross_len),
+                        sample_step=float(sample_step),
+                        tol=float(tol),
+                        min_run=float(min_run),
+                        min_depth_from_bottom=float(min_depth),
+                        slope_text=slope,
+                        bottom_w=float(bottom_w),
+                    )
 
-                st.dataframe(df, use_container_width=True)
-                csv = df.to_csv(index=False, sep=";").encode("utf-8")
-                st.download_button(
-                    "⬇️ Lae alla CSV",
-                    data=csv,
-                    file_name=f"{p['name']}_pk_tabel.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                )
+                    df = pd.DataFrame(res["rows"])
 
-        st.divider()
+                    st.success(f"✅ Kokku maht: {res['total_volume_m3']:.3f} m³")
+                    st.write(f"Telje pikkus: **{res['axis_length_m']:.2f} m** | PK-sid: **{res['count']}**")
 
-        # ---------------- R2 files ----------------
-        st.subheader("📤 Failid (Cloudflare R2)")
-        uploads = st.file_uploader("Laadi üles failid", accept_multiple_files=True, key="proj_files")
-        if uploads:
-            prefix = project_prefix(p["name"])
-            for up in uploads:
-                upload_file(s3, prefix, up)
-            st.success(f"Üles laaditud {len(uploads)} faili.")
-            st.rerun()
+                    planned_area = None
+                    if res["axis_length_m"] > 0 and res["total_volume_m3"] is not None:
+                        planned_area = float(res["total_volume_m3"] / res["axis_length_m"])
 
-        st.subheader("📄 Projekti failid")
-        prefix = project_prefix(p["name"])
-        files = list_files(s3, prefix)
+                    # Save to DB (and save selected landxml key too)
+                    set_project_landxml(
+                        p["id"],
+                        landxml_key=landxml_key,
+                        planned_volume_m3=float(res["total_volume_m3"]),
+                        planned_length_m=float(res["axis_length_m"]),
+                        planned_area_m2=planned_area,
+                    )
 
-        if not files:
-            st.info("Selles projektis pole veel faile.")
-            return
+                    st.dataframe(df, use_container_width=True)
 
-        for f in files:
-            a, bcol, c = st.columns([6, 2, 2])
-            with a:
-                st.write(f"📄 {f['name']}")
-                st.caption(f"{f['size'] / 1024:.1f} KB")
-            with bcol:
-                data = download_bytes(s3, f["key"])
-                st.download_button(
-                    "⬇️ Laadi alla",
-                    data=data,
-                    file_name=f["name"],
-                    key=f"dl_{f['key']}",
-                    use_container_width=True,
-                )
-            with c:
-                if st.button("🗑️ Kustuta", key=f"del_{f['key']}", use_container_width=True):
-                    delete_key(s3, f["key"])
+                    csv = df.to_csv(index=False, sep=";").encode("utf-8")
+                    st.download_button(
+                        "⬇️ Lae alla CSV",
+                        data=csv,
+                        file_name=f"{p['name']}_pk_tabel.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
+
+                    st.info("Tulemused salvestati projekti planned_* väljade alla (DB).")
+
                     st.rerun()
+
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        # =========================
+        # FAILID (R2 upload/list)
+        # =========================
+        with tab_files:
+            st.markdown('<div class="block">', unsafe_allow_html=True)
+            st.subheader("📤 Failid (Cloudflare R2)")
+
+            uploads = st.file_uploader("Laadi üles failid", accept_multiple_files=True, key="proj_files")
+            if uploads:
+                prefix = project_prefix(p["name"])
+                for up in uploads:
+                    upload_file(s3, prefix, up)
+                st.success(f"Üles laaditud {len(uploads)} faili.")
+                st.rerun()
+
+            st.markdown("</div>", unsafe_allow_html=True)
+
+            st.subheader("📄 Projekti failid")
+            prefix = project_prefix(p["name"])
+            files = list_files(s3, prefix)
+
+            if not files:
+                st.info("Selles projektis pole veel faile.")
+                return
+
+            for f in files:
+                a, bcol, c = st.columns([6, 2, 2])
+                with a:
+                    st.write(f"📄 {f['name']}")
+                    st.caption(f"{f['size'] / 1024:.1f} KB")
+                with bcol:
+                    data = download_bytes(s3, f["key"])
+                    st.download_button(
+                        "⬇️ Laadi alla",
+                        data=data,
+                        file_name=f["name"],
+                        key=f"dl_{f['key']}",
+                        use_container_width=True,
+                    )
+                with c:
+                    if st.button("🗑️ Kustuta", key=f"del_{f['key']}", use_container_width=True):
+                        delete_key(s3, f["key"])
+                        st.rerun()
