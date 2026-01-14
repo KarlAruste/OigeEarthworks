@@ -10,7 +10,6 @@ from db import (
     get_project,
     set_project_landxml,
 )
-
 from r2 import (
     get_s3,
     project_prefix,
@@ -23,14 +22,14 @@ from r2 import (
 
 from landxml import (
     read_landxml_tin_from_bytes,
+    read_axis_from_bytes,
     compute_pk_table_from_landxml,
-    parse_axis_points_from_bytes,
     polyline_length,
 )
 
 
 # -------------------------
-# small helpers
+# Small helpers
 # -------------------------
 def _downsample_points(xyz: np.ndarray, max_pts: int = 20000) -> np.ndarray:
     if xyz is None or xyz.size == 0:
@@ -42,20 +41,35 @@ def _downsample_points(xyz: np.ndarray, max_pts: int = 20000) -> np.ndarray:
     return xyz[idx]
 
 
-def _list_landxml_keys_for_project(s3, project_name: str) -> list[dict]:
-    """
-    Returns list of objects under landxml/ prefix.
-    Each dict: {name,key,size}
-    """
-    prefix = project_prefix(project_name) + "landxml/"
-    files = list_files(s3, prefix)
+def _nice_num(x: float, nd: int = 3) -> str:
+    try:
+        return f"{float(x):.{nd}f}"
+    except Exception:
+        return "-"
+
+
+def _list_project_landxml_keys(s3, proj_name: str):
+    """Return list of dicts from R2 landxml/ folder."""
+    prefix = project_prefix(proj_name) + "landxml/"
+    files = list_files(s3, prefix) or []
     # keep only xml/landxml
     out = []
     for f in files:
-        nm = (f.get("name") or "").lower()
-        if nm.endswith(".xml") or nm.endswith(".landxml"):
+        n = (f.get("name") or "").lower()
+        if n.endswith(".xml") or n.endswith(".landxml"):
             out.append(f)
-    # newest first (list_files already likely sorted, but keep stable)
+    return out
+
+
+def _list_project_axis_keys(s3, proj_name: str):
+    """Return list of dicts from R2 axis/ folder."""
+    prefix = project_prefix(proj_name) + "axis/"
+    files = list_files(s3, prefix) or []
+    out = []
+    for f in files:
+        n = (f.get("name") or "").lower()
+        if n.endswith(".xml") or n.endswith(".landxml") or n.endswith(".csv") or n.endswith(".txt"):
+            out.append(f)
     return out
 
 
@@ -68,15 +82,16 @@ def render_projects_view():
     s3 = get_s3()
     projects = list_projects()
 
-    # session defaults
+    # Session defaults
     st.session_state.setdefault("active_project_id", None)
 
-    # Mahud: cached selected surface and axis
+    # Mahud state
     st.session_state.setdefault("mahud_surface_key", None)
     st.session_state.setdefault("mahud_surface_bytes", None)
-    st.session_state.setdefault("mahud_axis_name", None)
-    st.session_state.setdefault("mahud_axis_xy", None)  # list[(E,N)]
-    st.session_state.setdefault("mahud_swap_axis_en", False)
+
+    st.session_state.setdefault("mahud_axis_key", None)
+    st.session_state.setdefault("mahud_axis_xy", None)
+    st.session_state.setdefault("mahud_axis_info", None)
 
     # ---------------- Create project ----------------
     st.markdown('<div class="block">', unsafe_allow_html=True)
@@ -115,12 +130,12 @@ def render_projects_view():
             if st.button(proj["name"], use_container_width=True, key=f"projbtn_{proj['id']}"):
                 st.session_state["active_project_id"] = proj["id"]
 
-                # reset Mahud state when switching project
+                # reset mahud view state on project switch
                 st.session_state["mahud_surface_key"] = None
                 st.session_state["mahud_surface_bytes"] = None
-                st.session_state["mahud_axis_name"] = None
+                st.session_state["mahud_axis_key"] = None
                 st.session_state["mahud_axis_xy"] = None
-                st.session_state["mahud_swap_axis_en"] = False
+                st.session_state["mahud_axis_info"] = None
 
                 st.rerun()
 
@@ -138,149 +153,144 @@ def render_projects_view():
         st.subheader(p["name"])
         st.caption(f"Tähtaeg: {p.get('end_date')}")
 
-        tabs = st.tabs(["Üldine", "Mahud", "Failid"])
+        tab_general, tab_mahud, tab_files = st.tabs(["Üldine", "Mahud", "Failid"])
 
-        # =========================================================
-        # TAB 1: ÜLDINE
-        # =========================================================
-        with tabs[0]:
+        # ---------------- ÜLDINE ----------------
+        with tab_general:
             st.markdown('<div class="block">', unsafe_allow_html=True)
-            st.subheader("📌 Projekti info")
+            st.subheader("📊 Projekti salvestatud planeeritud väärtused (DB)")
 
-            p2 = get_project(pid)
-            if p2 and p2.get("planned_volume_m3") is not None:
-                st.markdown("### Salvestatud planeeritud väärtused (Mahud)")
-                st.write(f"**Planned length:** {float(p2['planned_length_m'] or 0):.2f} m")
-                st.write(f"**Planned area:** {float(p2['planned_area_m2'] or 0):.3f} m²")
-                st.write(f"**Planned volume:** {float(p2['planned_volume_m3'] or 0):.3f} m³")
-                if p2.get("landxml_key"):
-                    st.caption(f"LandXML key: {p2.get('landxml_key')}")
+            if p.get("planned_volume_m3") is None:
+                st.info("Planeeritud mahtu pole veel arvutatud.")
             else:
-                st.info("Mahte pole veel arvutatud. Mine tab’i **Mahud**.")
+                st.write(f"**Planned length:** {float(p.get('planned_length_m') or 0):.2f} m")
+                st.write(f"**Planned area:** {float(p.get('planned_area_m2') or 0):.3f} m²")
+                st.write(f"**Planned volume:** {float(p.get('planned_volume_m3') or 0):.3f} m³")
+                st.caption(f"LandXML key: {p.get('landxml_key') or '-'}")
 
             st.markdown("</div>", unsafe_allow_html=True)
 
-        # =========================================================
-        # TAB 2: MAHUD
-        # =========================================================
-        with tabs[1]:
+        # ---------------- MAHUD ----------------
+        with tab_mahud:
             st.markdown('<div class="block">', unsafe_allow_html=True)
-            st.subheader("🧮 Mahud (LandXML + telg Civil3D-st)")
+            st.subheader("🧮 Mahud (LandXML + Telg/Alignment import)")
 
-            st.caption(
-                "1) Vali või laadi üles LandXML pind (R2). "
-                "2) Impordi telg (Civil3D Alignment/Polyline LandXML või CSV/TXT). "
-                "3) Arvuta PK tabel ja kogu maht."
-            )
+            st.caption("Siin valid või laed pinnamudeli (LandXML) ja impordid telje (Civil3D polyline/alignment).")
 
-            # ---------------------------
-            # 1) Surface: upload + select existing
-            # ---------------------------
-            st.markdown("### 1) LandXML pind (R2)")
+            # ---- 1) Surface: choose existing from R2 ----
+            st.markdown("### 1) Pinnamudel (LandXML)")
 
-            landxml_files = _list_landxml_keys_for_project(s3, p["name"])
-            existing_names = [f["name"] for f in landxml_files]
+            landxml_files = _list_project_landxml_keys(s3, p["name"])
+            options = ["— vali R2-st —"] + [f"{f['name']}  ({f['size']/1024:.1f} KB)" for f in landxml_files]
+            sel = st.selectbox("Vali varem üles laetud LandXML", options, index=0)
 
-            cA, cB = st.columns([2, 2])
+            cA, cB = st.columns([1, 1])
             with cA:
-                chosen = st.selectbox(
-                    "Vali varem üles laaditud LandXML",
-                    options=["— vali —"] + existing_names,
-                    index=0,
-                )
-            with cB:
-                up = st.file_uploader(
-                    "Või laadi uus LandXML üles",
-                    type=["xml", "landxml"],
-                    key="mahud_landxml_upload",
-                )
+                if st.button("Ava valitud LandXML", use_container_width=True):
+                    if sel.startswith("—"):
+                        st.warning("Vali enne LandXML fail.")
+                    else:
+                        idx = options.index(sel) - 1
+                        key = landxml_files[idx]["key"]
+                        xml_bytes = download_bytes(s3, key)
+                        st.session_state["mahud_surface_key"] = key
+                        st.session_state["mahud_surface_bytes"] = xml_bytes
+                        st.success(f"Avatud: {landxml_files[idx]['name']}")
+                        st.rerun()
 
-            if up is not None:
-                if st.button("Salvesta LandXML R2-sse", use_container_width=True):
+            with cB:
+                up = st.file_uploader("...või lae uus LandXML", type=["xml", "landxml"], key="mahud_landxml_upload")
+                if up and st.button("Salvesta uus LandXML R2-sse", use_container_width=True):
                     prefix = project_prefix(p["name"]) + "landxml/"
                     key = upload_file(s3, prefix, up)
-                    st.success("LandXML salvestatud R2-sse.")
-                    # refresh select
-                    st.session_state["mahud_surface_key"] = key
-                    st.session_state["mahud_surface_bytes"] = download_bytes(s3, key)
+                    st.success("Salvestatud. Vali see nüüd rippmenüüst ja vajuta 'Ava'.")
                     st.rerun()
 
-            # if choose existing
-            if chosen and chosen != "— vali —":
-                key = next((f["key"] for f in landxml_files if f["name"] == chosen), None)
-                if key and key != st.session_state.get("mahud_surface_key"):
-                    st.session_state["mahud_surface_key"] = key
-                    st.session_state["mahud_surface_bytes"] = download_bytes(s3, key)
-
             xml_bytes = st.session_state.get("mahud_surface_bytes")
+            xml_key = st.session_state.get("mahud_surface_key")
+
             if xml_bytes:
                 # show quick stats
                 try:
                     pts_dict, _faces = read_landxml_tin_from_bytes(xml_bytes)
                     xyz = np.array(list(pts_dict.values()), dtype=float)  # (E,N,Z)
-                    xyz_show = _downsample_points(xyz, max_pts=20000)
-                    x_min = float(np.nanmin(xyz_show[:, 0])); x_max = float(np.nanmax(xyz_show[:, 0]))
-                    y_min = float(np.nanmin(xyz_show[:, 1])); y_max = float(np.nanmax(xyz_show[:, 1]))
-                    st.caption(f"LandXML punktid: {len(xyz)} | E min/max: {x_min:.3f} / {x_max:.3f} | N min/max: {y_min:.3f} / {y_max:.3f}")
+                    xyz_show = _downsample_points(xyz, 20000)
+                    st.caption(
+                        f"LandXML punkte: {len(xyz):,} | Kuvan: {len(xyz_show):,} | "
+                        f"E min/max: {_nice_num(np.min(xyz[:,0]))} / {_nice_num(np.max(xyz[:,0]))} | "
+                        f"N min/max: {_nice_num(np.min(xyz[:,1]))} / {_nice_num(np.max(xyz[:,1]))}"
+                    )
                 except Exception as e:
                     st.error(f"LandXML lugemine ebaõnnestus: {e}")
                     st.stop()
             else:
-                st.info("Vali või lae LandXML, et jätkata.")
+                st.info("Vali või lae LandXML, et telge importida ja maht arvutada.")
                 st.markdown("</div>", unsafe_allow_html=True)
                 return
 
             st.divider()
 
-            # ---------------------------
-            # 2) Axis import
-            # ---------------------------
-            st.markdown("### 2) Telg (Civil3D alignment/polyline)")
+            # ---- 2) Axis import ----
+            st.markdown("### 2) Telg / Alignment (import Civil3D-st)")
 
-            swap_axis = st.checkbox(
-                "Telje koordinaadid on vahetuses (N=Easting ja E=Northing) → Swap E/N",
-                value=bool(st.session_state.get("mahud_swap_axis_en", False)),
-            )
-            st.session_state["mahud_swap_axis_en"] = bool(swap_axis)
+            axis_files = _list_project_axis_keys(s3, p["name"])
+            axis_opts = ["— vali R2-st —"] + [f"{f['name']}  ({f['size']/1024:.1f} KB)" for f in axis_files]
+            axis_sel = st.selectbox("Vali varem üles laetud telg", axis_opts, index=0)
 
-            axis_file = st.file_uploader(
-                "Laadi telje fail (.xml/.landxml alignment või .csv/.txt punktid)",
-                type=["xml", "landxml", "csv", "txt"],
-                key="mahud_axis_upload",
-            )
+            col1, col2 = st.columns([1, 1])
 
-            if axis_file is not None:
-                if st.button("Impordi telg", use_container_width=True):
-                    try:
-                        axis_bytes = axis_file.getvalue()
-                        axis_xy = parse_axis_points_from_bytes(
-                            axis_bytes,
-                            filename=axis_file.name,
-                            force_swap_en=swap_axis,
-                        )
-                        st.session_state["mahud_axis_name"] = axis_file.name
-                        st.session_state["mahud_axis_xy"] = axis_xy
-                        st.success(f"Telg imporditud: {axis_file.name} | Punkte: {len(axis_xy)} | Pikkus: {polyline_length(axis_xy):.2f} m")
+            with col1:
+                force_swap = st.checkbox("Telje koordinaadid on vahetuses (N=Easting ja E=Northing) → Swap E/N", value=True)
+
+                if st.button("Ava valitud telg", use_container_width=True):
+                    if axis_sel.startswith("—"):
+                        st.warning("Vali enne telje fail.")
+                    else:
+                        i = axis_opts.index(axis_sel) - 1
+                        key = axis_files[i]["key"]
+                        b = download_bytes(s3, key)
+
+                        info = read_axis_from_bytes(b, filename=axis_files[i]["name"], force_swap_en=force_swap)
+                        st.session_state["mahud_axis_key"] = key
+                        st.session_state["mahud_axis_xy"] = info["axis_xy"]
+                        st.session_state["mahud_axis_info"] = info
+                        st.success(f"Telg avatud: {axis_files[i]['name']}")
                         st.rerun()
-                    except Exception as e:
-                        st.error(str(e))
 
-            axis_xy_abs = st.session_state.get("mahud_axis_xy")
-            if axis_xy_abs and len(axis_xy_abs) >= 2:
-                st.caption(f"Telg: {st.session_state.get('mahud_axis_name')} | Punkte: {len(axis_xy_abs)} | Pikkus: {polyline_length(axis_xy_abs):.2f} m")
-                df_axis = pd.DataFrame(axis_xy_abs, columns=["E", "N"])
+            with col2:
+                axis_up = st.file_uploader(
+                    "Laadi telje fail (.xml/.landxml alignment või .csv/.txt punktid)",
+                    type=["xml", "landxml", "csv", "txt"],
+                    key="mahud_axis_upload",
+                )
+                if axis_up and st.button("Salvesta telg R2-sse", use_container_width=True):
+                    prefix = project_prefix(p["name"]) + "axis/"
+                    key = upload_file(s3, prefix, axis_up)
+                    st.success("Telg salvestatud. Vali see rippmenüüst ja vajuta 'Ava'.")
+                    st.rerun()
+
+            axis_xy = st.session_state.get("mahud_axis_xy")
+            axis_info = st.session_state.get("mahud_axis_info")
+
+            if axis_xy and len(axis_xy) >= 2:
+                declared = axis_info.get("declared_length_m") if isinstance(axis_info, dict) else None
+                st.success(
+                    f"Telg punkte: {len(axis_xy)} | "
+                    f"Pikkus (arvutatud): {polyline_length(axis_xy):.2f} m"
+                    + (f" | Alignment length attr: {declared:.2f} m" if isinstance(declared, (int, float)) else "")
+                )
+
                 with st.expander("Näita telje esimesed 10 punkti"):
-                    st.dataframe(df_axis.head(10), use_container_width=True)
+                    df_axis = pd.DataFrame(axis_xy[:10], columns=["E", "N"])
+                    st.dataframe(df_axis, use_container_width=True)
             else:
-                st.info("Impordi telg, et arvutada mahud.")
+                st.info("Impordi telg/alignment, et saaks PK tabeli arvutada.")
                 st.markdown("</div>", unsafe_allow_html=True)
                 return
 
             st.divider()
 
-            # ---------------------------
-            # 3) Parameters + compute
-            # ---------------------------
+            # ---- 3) Parameters + compute ----
             st.markdown("### 3) Arvutusparameetrid")
 
             c1, c2, c3 = st.columns(3)
@@ -298,10 +308,10 @@ def render_projects_view():
 
             if st.button("Arvuta PK tabel", use_container_width=True):
                 try:
-                    with st.spinner("Arvutan PK-d ja mahtu..."):
+                    with st.spinner("Arvutan PK tabelit..."):
                         res = compute_pk_table_from_landxml(
                             xml_bytes=xml_bytes,
-                            axis_xy_abs=axis_xy_abs,
+                            axis_xy_abs=axis_xy,
                             pk_step=float(pk_step),
                             cross_len=float(cross_len),
                             sample_step=float(sample_step),
@@ -320,10 +330,10 @@ def render_projects_view():
                     if res["axis_length_m"] > 0 and res["total_volume_m3"] is not None:
                         planned_area = float(res["total_volume_m3"] / res["axis_length_m"])
 
-                    key = st.session_state.get("mahud_surface_key") or (p.get("landxml_key") or "")
+                    key_to_save = xml_key or (p.get("landxml_key") or "")
                     set_project_landxml(
                         p["id"],
-                        landxml_key=key,
+                        landxml_key=key_to_save,
                         planned_volume_m3=float(res["total_volume_m3"]),
                         planned_length_m=float(res["axis_length_m"]),
                         planned_area_m2=planned_area,
@@ -341,16 +351,13 @@ def render_projects_view():
                     )
 
                     st.info("Tulemused salvestati projekti planned_* väljade alla (DB).")
-
                 except Exception as e:
                     st.error(f"Arvutus ebaõnnestus: {e}")
 
             st.markdown("</div>", unsafe_allow_html=True)
 
-        # =========================================================
-        # TAB 3: FAILID (R2)
-        # =========================================================
-        with tabs[2]:
+        # ---------------- FAILID ----------------
+        with tab_files:
             st.markdown('<div class="block">', unsafe_allow_html=True)
             st.subheader("📤 Failid (Cloudflare R2)")
 
