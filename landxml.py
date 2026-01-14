@@ -1,5 +1,6 @@
 # landxml.py
 import math
+import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
@@ -19,6 +20,34 @@ def _iter_by_local(root, local_name: str):
     for el in root.iter():
         if _strip(el.tag).lower() == ln:
             yield el
+
+
+# ----------------------------
+# Heuristics: E/N swap detection
+# (L-EST97: N ~ 6-7 mil, E ~ 3-8e5)
+# ----------------------------
+def _needs_swap_en(x_med: float, y_med: float) -> bool:
+    """
+    Returns True if (x,y) likely in (N,E) order and needs swap to (E,N).
+    Typical:
+      Northing ~ 6,000,000..7,000,000
+      Easting  ~   200,000..900,000
+    """
+    # x looks like Northing (millions) and y looks like Easting (hundreds of thousands)
+    if x_med > 2_000_000.0 and y_med < 2_000_000.0:
+        return True
+    return False
+
+
+def _dedupe_consecutive(xy: List[Tuple[float, float]], eps: float = 1e-9) -> List[Tuple[float, float]]:
+    out: List[Tuple[float, float]] = []
+    for p in xy:
+        if not out:
+            out.append(p)
+            continue
+        if abs(out[-1][0] - p[0]) > eps or abs(out[-1][1] - p[1]) > eps:
+            out.append(p)
+    return out
 
 
 # ----------------------------
@@ -50,7 +79,7 @@ def read_landxml_tin_from_bytes(xml_bytes: bytes) -> Tuple[Dict[int, Tuple[float
             b = float(parts[1])
             z = float(parts[2])
             pid_i = int(pid)
-            pts[pid_i] = (a, b, z)  # TEMP, order fixed below
+            pts[pid_i] = (a, b, z)  # TEMP order, fixed below
         except Exception:
             continue
 
@@ -75,18 +104,127 @@ def read_landxml_tin_from_bytes(xml_bytes: bytes) -> Tuple[Dict[int, Tuple[float
     if not faces:
         raise ValueError("LandXML: ei leidnud <F> faces (Definition/Faces/F).")
 
-    # --- Fix coordinate order ---
-    # Many Estonian files store N E Z (Northing ~ 6.5M, Easting ~ 0.6M)
-    # Output must be E N Z.
-    arr = np.array(list(pts.values()), dtype=float)  # (a,b,z) where a/b could be N/E
+    # --- Fix coordinate order to E,N,Z ---
+    arr = np.array(list(pts.values()), dtype=float)  # (a,b,z) where a/b may be N/E
     a_med = float(np.median(arr[:, 0]))
     b_med = float(np.median(arr[:, 1]))
 
-    need_swap = (a_med > 2_000_000.0 and b_med < 2_000_000.0)
-    if need_swap:
+    if _needs_swap_en(a_med, b_med):
         pts = {pid: (val[1], val[0], val[2]) for pid, val in pts.items()}  # E,N,Z
 
     return pts, faces
+
+
+# ----------------------------
+# Axis / Alignment import from bytes
+# Supports:
+#  - LandXML Alignment CoordGeom: <Line><Start>..</Start><End>..</End></Line>, <Curve>..<PI>..</PI> etc
+#  - Polyline lists: <PntList2D> "x y x y ..."
+#  - CSV/TXT: E;N or E N or N E
+# Output ALWAYS: list[(E,N)]
+# ----------------------------
+def parse_axis_points_from_bytes(
+    axis_bytes: bytes,
+    filename: str = "axis",
+    force_swap_en: bool = False,
+) -> List[Tuple[float, float]]:
+    """
+    Reads axis polyline points from:
+      - LandXML Alignment file (CoordGeom)
+      - CSV/TXT list of points
+
+    Returns list of (E,N).
+
+    force_swap_en=True will swap (E,N) <-> (N,E) after read.
+    """
+    name = (filename or "axis").lower()
+
+    # --- 1) If looks like XML / LandXML ---
+    if name.endswith(".xml") or name.endswith(".landxml") or axis_bytes.lstrip().startswith(b"<"):
+        try:
+            root = ET.fromstring(axis_bytes)
+
+            pts: List[Tuple[float, float]] = []
+
+            # a) PntList2D (common in some exports)
+            # Text format: "x y x y x y ..."
+            for pl in _iter_by_local(root, "PntList2D"):
+                txt = (pl.text or "").strip()
+                if not txt:
+                    continue
+                nums = [float(x) for x in re.split(r"[,\s]+", txt) if x.strip()]
+                if len(nums) >= 4 and len(nums) % 2 == 0:
+                    for i in range(0, len(nums), 2):
+                        pts.append((float(nums[i]), float(nums[i + 1])))
+
+            # b) CoordGeom elements order: Start/End/PI
+            # We take points in document order for: Start, PI, End
+            if not pts:
+                for tagname in ("Start", "PI", "End"):
+                    for el in _iter_by_local(root, tagname):
+                        txt = (el.text or "").strip()
+                        if not txt:
+                            continue
+                        parts = re.split(r"[,\s]+", txt)
+                        if len(parts) >= 2:
+                            try:
+                                x = float(parts[0])
+                                y = float(parts[1])
+                                pts.append((x, y))
+                            except Exception:
+                                pass
+
+            pts = _dedupe_consecutive(pts)
+
+            if len(pts) < 2:
+                raise ValueError("Telje failist ei leitud piisavalt punkte (vähemalt 2).")
+
+            # Heuristic swap based on medians (common Civil3D: N E)
+            arr = np.array(pts, dtype=float)
+            x_med = float(np.median(arr[:, 0]))
+            y_med = float(np.median(arr[:, 1]))
+
+            if _needs_swap_en(x_med, y_med):
+                pts = [(y, x) for (x, y) in pts]  # -> E,N
+
+            if force_swap_en:
+                pts = [(y, x) for (x, y) in pts]
+
+            return pts
+        except Exception as e:
+            raise ValueError(f"Telje XML/LandXML lugemine ebaõnnestus: {e}")
+
+    # --- 2) CSV/TXT fallback ---
+    txt = axis_bytes.decode("utf-8", errors="ignore")
+    lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
+    pts: List[Tuple[float, float]] = []
+    for ln in lines:
+        # accept "E;N", "E,N", "E N", maybe with headers
+        parts = re.split(r"[;,\s]+", ln)
+        if len(parts) < 2:
+            continue
+        try:
+            a = float(parts[0])
+            b = float(parts[1])
+            pts.append((a, b))
+        except Exception:
+            continue
+
+    pts = _dedupe_consecutive(pts)
+    if len(pts) < 2:
+        raise ValueError("Telje CSV/TXT-st ei leitud piisavalt punkte (vähemalt 2).")
+
+    arr = np.array(pts, dtype=float)
+    x_med = float(np.median(arr[:, 0]))
+    y_med = float(np.median(arr[:, 1]))
+
+    if _needs_swap_en(x_med, y_med):
+        pts = [(y, x) for (x, y) in pts]  # -> E,N
+
+    if force_swap_en:
+        pts = [(y, x) for (x, y) in pts]
+
+    return pts
 
 
 # ----------------------------
@@ -224,13 +362,6 @@ def z_at_xy(idx: TinIndex, px: float, py: float) -> Optional[float]:
     return float(nn[2])
 
 
-def snap_xy_to_tin(idx: TinIndex, px: float, py: float) -> Tuple[float, float, float]:
-    nn = nearest_point_xyz(idx, px, py, max_rings=10)
-    if nn is None:
-        return (float(px), float(py), float("nan"))
-    return (float(nn[0]), float(nn[1]), float(nn[2]))
-
-
 # ----------------------------
 # Profiles + edges/depth
 # ----------------------------
@@ -339,13 +470,7 @@ def find_edges_and_depth(
 # Slope + area
 # ----------------------------
 def parse_slope_ratio(text: str) -> float:
-    """
-    '1:2' -> 2.0 (H/V)
-    or '2' -> 2.0
-    """
-    t = (text or "").strip().replace(" ", "")
-    if not t:
-        return 2.0
+    t = text.strip().replace(" ", "")
     if ":" in t:
         a, b = t.split(":", 1)
         v = float(a)
@@ -362,7 +487,7 @@ def area_trapezoid(bottom_w: float, depth: float, slope_h_over_v: float) -> floa
 
 
 # ----------------------------
-# Polyline helpers (ABS coords! E,N)
+# Polyline helpers (ABS coords)
 # ----------------------------
 def polyline_cumlen(xy: List[Tuple[float, float]]) -> np.ndarray:
     cum = [0.0]
@@ -424,14 +549,11 @@ def pk_fmt(meters: int) -> str:
 
 
 # ----------------------------
-# PK table computation
-# Backward compatible:
-#   - axis_xy_abs (preferred)
-#   - axis_xy (older)
+# PK table computation from LandXML bytes + axis ABS polyline
 # ----------------------------
 def compute_pk_table_from_landxml(
     xml_bytes: bytes,
-    axis_xy_abs: Optional[List[Tuple[float, float]]] = None,
+    axis_xy_abs: List[Tuple[float, float]] = None,  # ABS (E,N)
     pk_step: float = 1.0,
     cross_len: float = 25.0,
     sample_step: float = 0.1,
@@ -440,11 +562,16 @@ def compute_pk_table_from_landxml(
     min_depth_from_bottom: float = 0.3,
     slope_text: str = "1:2",
     bottom_w: float = 0.40,
-    **kwargs,
+    # backward-compat alias:
+    axis_xy: List[Tuple[float, float]] = None,
 ):
-    # accept axis_xy as alias
-    if axis_xy_abs is None:
-        axis_xy_abs = kwargs.get("axis_xy")
+    """
+    Returns dict:
+      rows: list of pk rows
+      count, axis_length_m, total_volume_m3
+    """
+    if axis_xy_abs is None and axis_xy is not None:
+        axis_xy_abs = axis_xy
     if not axis_xy_abs or len(axis_xy_abs) < 2:
         raise ValueError("Telg puudub või liiga lühike (vähemalt 2 punkti).")
 
@@ -479,7 +606,7 @@ def compute_pk_table_from_landxml(
             min_run=min_run,
             sample_step=sample_step,
             min_depth_from_bottom=min_depth_from_bottom,
-            center_window_m=min(6.0, cross_len / 3.0),
+            center_window_m=min(6.0, cross_len / 3.0)
         )
 
         pk_label = pk_fmt(int(round(s)))
@@ -496,14 +623,13 @@ def compute_pk_table_from_landxml(
             })
             continue
 
-        width = float(info["width"])
         depth = float(info["depth"])
         edge_z = float(info["edge_z"])
         bottom_z = float(info["bottom_z"])
+        width = float(info["width"])
 
         A = float(area_trapezoid(bottom_w=bottom_w, depth=depth, slope_h_over_v=slope_hv))
         V = float(A * pk_step)
-
         total_volume += V
 
         rows.append({
