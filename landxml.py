@@ -1,9 +1,8 @@
 # landxml.py
 import math
-import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 
 import numpy as np
 
@@ -22,50 +21,26 @@ def _iter_by_local(root, local_name: str):
             yield el
 
 
-# ----------------------------
-# Heuristics: E/N swap detection
-# (L-EST97: N ~ 6-7 mil, E ~ 3-8e5)
-# ----------------------------
-def _needs_swap_en(x_med: float, y_med: float) -> bool:
-    """
-    Returns True if (x,y) likely in (N,E) order and needs swap to (E,N).
-    Typical:
-      Northing ~ 6,000,000..7,000,000
-      Easting  ~   200,000..900,000
-    """
-    # x looks like Northing (millions) and y looks like Easting (hundreds of thousands)
-    if x_med > 2_000_000.0 and y_med < 2_000_000.0:
-        return True
-    return False
-
-
-def _dedupe_consecutive(xy: List[Tuple[float, float]], eps: float = 1e-9) -> List[Tuple[float, float]]:
-    out: List[Tuple[float, float]] = []
-    for p in xy:
-        if not out:
-            out.append(p)
-            continue
-        if abs(out[-1][0] - p[0]) > eps or abs(out[-1][1] - p[1]) > eps:
-            out.append(p)
-    return out
+def _find_first_by_local(root, local_name: str) -> Optional[ET.Element]:
+    for el in _iter_by_local(root, local_name):
+        return el
+    return None
 
 
 # ----------------------------
 # Read LandXML TIN from bytes
 # Supports:
 #  - <Surfaces><Surface><Definition surfType="TIN"><Pnts><P ...>N E Z</P> ...</Pnts><Faces><F>...</F></Faces>
+# Output ALWAYS: pts = {id: (E, N, Z)}
 # ----------------------------
-def read_landxml_tin_from_bytes(xml_bytes: bytes) -> Tuple[Dict[int, Tuple[float, float, float]], List[Tuple[int, int, int]]]:
-    """
-    Returns:
-      pts: {id: (E, N, Z)}  <-- ALWAYS E,N,Z in output
-      faces: [(a,b,c), ...]
-    """
+def read_landxml_tin_from_bytes(
+    xml_bytes: bytes,
+) -> Tuple[Dict[int, Tuple[float, float, float]], List[Tuple[int, int, int]]]:
     root = ET.fromstring(xml_bytes)
 
-    # --- points ---
     pts: Dict[int, Tuple[float, float, float]] = {}
 
+    # points
     for p in _iter_by_local(root, "P"):
         pid = p.get("id")
         txt = (p.text or "").strip()
@@ -78,15 +53,14 @@ def read_landxml_tin_from_bytes(xml_bytes: bytes) -> Tuple[Dict[int, Tuple[float
             a = float(parts[0])
             b = float(parts[1])
             z = float(parts[2])
-            pid_i = int(pid)
-            pts[pid_i] = (a, b, z)  # TEMP order, fixed below
+            pts[int(pid)] = (a, b, z)  # order fixed below
         except Exception:
             continue
 
     if not pts:
         raise ValueError("LandXML: ei leidnud <P> punkte (Definition/Pnts/P).")
 
-    # --- faces ---
+    # faces
     faces: List[Tuple[int, int, int]] = []
     for f in _iter_by_local(root, "F"):
         txt = (f.text or "").strip()
@@ -96,135 +70,186 @@ def read_landxml_tin_from_bytes(xml_bytes: bytes) -> Tuple[Dict[int, Tuple[float
         if len(parts) < 3:
             continue
         try:
-            a, b, c = int(parts[0]), int(parts[1]), int(parts[2])
-            faces.append((a, b, c))
+            faces.append((int(parts[0]), int(parts[1]), int(parts[2])))
         except Exception:
             continue
 
     if not faces:
         raise ValueError("LandXML: ei leidnud <F> faces (Definition/Faces/F).")
 
-    # --- Fix coordinate order to E,N,Z ---
-    arr = np.array(list(pts.values()), dtype=float)  # (a,b,z) where a/b may be N/E
+    # Fix coordinate order heuristic: if first looks like Northing (millions) and second like Easting (hundreds of thousands) -> swap.
+    arr = np.array(list(pts.values()), dtype=float)  # (a,b,z)
     a_med = float(np.median(arr[:, 0]))
     b_med = float(np.median(arr[:, 1]))
 
-    if _needs_swap_en(a_med, b_med):
+    need_swap = (a_med > 2_000_000.0 and b_med < 2_000_000.0)
+    if need_swap:
         pts = {pid: (val[1], val[0], val[2]) for pid, val in pts.items()}  # E,N,Z
 
     return pts, faces
 
 
 # ----------------------------
-# Axis / Alignment import from bytes
-# Supports:
-#  - LandXML Alignment CoordGeom: <Line><Start>..</Start><End>..</End></Line>, <Curve>..<PI>..</PI> etc
-#  - Polyline lists: <PntList2D> "x y x y ..."
-#  - CSV/TXT: E;N or E N or N E
-# Output ALWAYS: list[(E,N)]
+# Alignment / Axis import
+#  - LandXML Alignment: <Alignments><Alignment length="..." ...><CoordGeom> ... <Line> <Start> <End> ... <Curve> <Start>/<PI>/<End>
+#  - CSV/TXT: columns can be "E;N" or "N;E" or "x,y"
+# Output ALWAYS: [(E,N), ...]
 # ----------------------------
-def parse_axis_points_from_bytes(
-    axis_bytes: bytes,
-    filename: str = "axis",
+def _swap_en_if_needed_xy(xy: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    if not xy or len(xy) < 2:
+        return xy
+    a = np.array([p[0] for p in xy], dtype=float)
+    b = np.array([p[1] for p in xy], dtype=float)
+    a_med = float(np.median(a))
+    b_med = float(np.median(b))
+    # Typical Estonia: N ~ 6.x million, E ~ 0.3..0.8 million
+    need_swap = (a_med > 2_000_000.0 and b_med < 2_000_000.0)
+    if need_swap:
+        return [(y, x) for (x, y) in xy]
+    return xy
+
+
+def read_axis_from_bytes(
+    data: bytes,
+    filename: str,
     force_swap_en: bool = False,
-) -> List[Tuple[float, float]]:
+) -> Dict[str, Any]:
     """
-    Reads axis polyline points from:
-      - LandXML Alignment file (CoordGeom)
-      - CSV/TXT list of points
-
-    Returns list of (E,N).
-
-    force_swap_en=True will swap (E,N) <-> (N,E) after read.
+    Returns dict:
+      {
+        "axis_xy": [(E,N),...],
+        "axis_length_m": float,    # computed from points
+        "declared_length_m": float|None,  # from Alignment length attr if present
+        "source": "landxml_alignment"|"csv_txt"
+      }
     """
-    name = (filename or "axis").lower()
+    name = (filename or "").lower().strip()
 
-    # --- 1) If looks like XML / LandXML ---
-    if name.endswith(".xml") or name.endswith(".landxml") or axis_bytes.lstrip().startswith(b"<"):
+    # ---- try LandXML Alignment ----
+    if name.endswith(".xml") or name.endswith(".landxml"):
         try:
-            root = ET.fromstring(axis_bytes)
+            root = ET.fromstring(data)
 
-            pts: List[Tuple[float, float]] = []
+            # find first Alignment
+            align = None
+            for a in _iter_by_local(root, "Alignment"):
+                align = a
+                break
 
-            # a) PntList2D (common in some exports)
-            # Text format: "x y x y x y ..."
-            for pl in _iter_by_local(root, "PntList2D"):
-                txt = (pl.text or "").strip()
-                if not txt:
-                    continue
-                nums = [float(x) for x in re.split(r"[,\s]+", txt) if x.strip()]
-                if len(nums) >= 4 and len(nums) % 2 == 0:
-                    for i in range(0, len(nums), 2):
-                        pts.append((float(nums[i]), float(nums[i + 1])))
+            if align is not None:
+                declared = align.get("length")
+                declared_len = float(declared) if declared not in (None, "") else None
 
-            # b) CoordGeom elements order: Start/End/PI
-            # We take points in document order for: Start, PI, End
-            if not pts:
-                for tagname in ("Start", "PI", "End"):
-                    for el in _iter_by_local(root, tagname):
-                        txt = (el.text or "").strip()
-                        if not txt:
-                            continue
-                        parts = re.split(r"[,\s]+", txt)
-                        if len(parts) >= 2:
-                            try:
-                                x = float(parts[0])
-                                y = float(parts[1])
-                                pts.append((x, y))
-                            except Exception:
-                                pass
+                # Gather points from CoordGeom
+                # We prefer explicit Start/End points of each element. This gives a dense enough polyline for straight segments.
+                axis: List[Tuple[float, float]] = []
 
-            pts = _dedupe_consecutive(pts)
+                coord = None
+                for cg in align.iter():
+                    if _strip(cg.tag).lower() == "coordgeom":
+                        coord = cg
+                        break
 
-            if len(pts) < 2:
-                raise ValueError("Telje failist ei leitud piisavalt punkte (vähemalt 2).")
+                if coord is None:
+                    # fallback: sometimes alignment points are in <CoordGeom> but namespace issues; try local scan
+                    coord = _find_first_by_local(align, "CoordGeom")
 
-            # Heuristic swap based on medians (common Civil3D: N E)
-            arr = np.array(pts, dtype=float)
-            x_med = float(np.median(arr[:, 0]))
-            y_med = float(np.median(arr[:, 1]))
+                if coord is None:
+                    raise ValueError("Alignment leitud, aga <CoordGeom> puudub.")
 
-            if _needs_swap_en(x_med, y_med):
-                pts = [(y, x) for (x, y) in pts]  # -> E,N
+                def _parse_xy(text: str) -> Tuple[float, float]:
+                    parts = (text or "").strip().replace(",", " ").split()
+                    if len(parts) < 2:
+                        raise ValueError("Coord text invalid")
+                    return float(parts[0]), float(parts[1])
 
-            if force_swap_en:
-                pts = [(y, x) for (x, y) in pts]
+                # iterate geometry primitives
+                for child in list(coord):
+                    tag = _strip(child.tag).lower()
+                    if tag in ("line", "curve", "spiral"):
+                        start_el = _find_first_by_local(child, "Start")
+                        end_el = _find_first_by_local(child, "End")
+                        pi_el = _find_first_by_local(child, "PI")
 
-            return pts
-        except Exception as e:
-            raise ValueError(f"Telje XML/LandXML lugemine ebaõnnestus: {e}")
+                        # Add Start
+                        if start_el is not None and (start_el.text or "").strip():
+                            axis.append(_parse_xy(start_el.text))
 
-    # --- 2) CSV/TXT fallback ---
-    txt = axis_bytes.decode("utf-8", errors="ignore")
+                        # Some curves include PI point; add it for better shape
+                        if pi_el is not None and (pi_el.text or "").strip():
+                            axis.append(_parse_xy(pi_el.text))
+
+                        # Add End
+                        if end_el is not None and (end_el.text or "").strip():
+                            axis.append(_parse_xy(end_el.text))
+
+                # de-duplicate consecutive identical points
+                cleaned: List[Tuple[float, float]] = []
+                for p in axis:
+                    if not cleaned:
+                        cleaned.append(p)
+                    else:
+                        if (abs(cleaned[-1][0] - p[0]) > 1e-9) or (abs(cleaned[-1][1] - p[1]) > 1e-9):
+                            cleaned.append(p)
+
+                if len(cleaned) < 2:
+                    raise ValueError("Alignmentist ei õnnestunud lugeda piisavalt punkte (vähemalt 2).")
+
+                # Heuristic swap to E,N + optional force swap
+                cleaned = _swap_en_if_needed_xy(cleaned)
+                if force_swap_en:
+                    cleaned = [(y, x) for (x, y) in cleaned]
+
+                return {
+                    "axis_xy": cleaned,
+                    "axis_length_m": polyline_length(cleaned),
+                    "declared_length_m": declared_len,
+                    "source": "landxml_alignment",
+                }
+        except Exception:
+            # fall through to CSV/TXT
+            pass
+
+    # ---- CSV/TXT points ----
+    txt = data.decode("utf-8", errors="ignore").strip()
+    if not txt:
+        raise ValueError("Telje fail on tühi.")
+
     lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
-    pts: List[Tuple[float, float]] = []
+    axis: List[Tuple[float, float]] = []
+
+    # detect separator
+    # allow: "E;N", "E,N", "E N"
     for ln in lines:
-        # accept "E;N", "E,N", "E N", maybe with headers
-        parts = re.split(r"[;,\s]+", ln)
+        # skip header-ish
+        low = ln.lower()
+        if any(k in low for k in ("e;", "n;", "e,n", "north", "east", "x;", "y;", "x,", "y,")) and not any(ch.isdigit() for ch in ln):
+            continue
+
+        s = ln.replace("\t", " ").replace(",", " ").replace(";", " ")
+        parts = [p for p in s.split() if p]
         if len(parts) < 2:
             continue
         try:
             a = float(parts[0])
             b = float(parts[1])
-            pts.append((a, b))
+            axis.append((a, b))
         except Exception:
             continue
 
-    pts = _dedupe_consecutive(pts)
-    if len(pts) < 2:
-        raise ValueError("Telje CSV/TXT-st ei leitud piisavalt punkte (vähemalt 2).")
+    if len(axis) < 2:
+        raise ValueError("Telje failist ei saanud lugeda punkte. Ootan CSV/TXT kujul: E;N või N;E.")
 
-    arr = np.array(pts, dtype=float)
-    x_med = float(np.median(arr[:, 0]))
-    y_med = float(np.median(arr[:, 1]))
-
-    if _needs_swap_en(x_med, y_med):
-        pts = [(y, x) for (x, y) in pts]  # -> E,N
-
+    axis = _swap_en_if_needed_xy(axis)
     if force_swap_en:
-        pts = [(y, x) for (x, y) in pts]
+        axis = [(y, x) for (x, y) in axis]
 
-    return pts
+    return {
+        "axis_xy": axis,
+        "axis_length_m": polyline_length(axis),
+        "declared_length_m": None,
+        "source": "csv_txt",
+    }
 
 
 # ----------------------------
@@ -271,7 +296,7 @@ class TinIndex:
 def build_tin_index(
     pts: Dict[int, Tuple[float, float, float]],
     faces: List[Tuple[int, int, int]],
-    target_bucket_count: int = 150_000
+    target_bucket_count: int = 150_000,
 ) -> TinIndex:
     tris = np.empty((len(faces), 3, 3), dtype=float)
     for i, (a, b, c) in enumerate(faces):
@@ -308,8 +333,7 @@ def build_tin_index(
 
     return TinIndex(
         tris=tris, minx=minx, miny=miny, cell=cell,
-        tri_buckets=tri_buckets, pt_buckets=pt_buckets,
-        pts_xyz=pts_xyz
+        tri_buckets=tri_buckets, pt_buckets=pt_buckets, pts_xyz=pts_xyz
     )
 
 
@@ -344,7 +368,7 @@ def z_at_xy(idx: TinIndex, px: float, py: float) -> Optional[float]:
     ix = int((px - idx.minx) // idx.cell)
     iy = int((py - idx.miny) // idx.cell)
 
-    candidates = []
+    candidates: List[int] = []
     for dx in (0, -1, 1):
         for dy in (0, -1, 1):
             candidates += idx.tri_buckets.get((ix + dx, iy + dy), [])
@@ -390,7 +414,7 @@ def find_edges_and_depth(
     min_run: float,
     sample_step: float,
     min_depth_from_bottom: float = 0.3,
-    center_window_m: float = 6.0
+    center_window_m: float = 6.0,
 ):
     valid = np.isfinite(zs)
     if valid.sum() < 5:
@@ -487,7 +511,7 @@ def area_trapezoid(bottom_w: float, depth: float, slope_h_over_v: float) -> floa
 
 
 # ----------------------------
-# Polyline helpers (ABS coords)
+# Polyline helpers (ABS coords!)
 # ----------------------------
 def polyline_cumlen(xy: List[Tuple[float, float]]) -> np.ndarray:
     cum = [0.0]
@@ -553,7 +577,8 @@ def pk_fmt(meters: int) -> str:
 # ----------------------------
 def compute_pk_table_from_landxml(
     xml_bytes: bytes,
-    axis_xy_abs: List[Tuple[float, float]] = None,  # ABS (E,N)
+    axis_xy_abs: Optional[List[Tuple[float, float]]] = None,
+    axis_xy: Optional[List[Tuple[float, float]]] = None,  # backwards compat
     pk_step: float = 1.0,
     cross_len: float = 25.0,
     sample_step: float = 0.1,
@@ -562,22 +587,14 @@ def compute_pk_table_from_landxml(
     min_depth_from_bottom: float = 0.3,
     slope_text: str = "1:2",
     bottom_w: float = 0.40,
-    # backward-compat alias:
-    axis_xy: List[Tuple[float, float]] = None,
 ):
-    """
-    Returns dict:
-      rows: list of pk rows
-      count, axis_length_m, total_volume_m3
-    """
-    if axis_xy_abs is None and axis_xy is not None:
-        axis_xy_abs = axis_xy
-    if not axis_xy_abs or len(axis_xy_abs) < 2:
-        raise ValueError("Telg puudub või liiga lühike (vähemalt 2 punkti).")
+    if axis_xy_abs is None:
+        axis_xy_abs = axis_xy or []
+    if len(axis_xy_abs) < 2:
+        raise ValueError("Telg peab olema vähemalt 2 punktiga.")
 
     pts, faces = read_landxml_tin_from_bytes(xml_bytes)
     idx = build_tin_index(pts, faces)
-
     slope_hv = parse_slope_ratio(slope_text)
 
     total_len = polyline_length(axis_xy_abs)
@@ -626,7 +643,6 @@ def compute_pk_table_from_landxml(
         depth = float(info["depth"])
         edge_z = float(info["edge_z"])
         bottom_z = float(info["bottom_z"])
-        width = float(info["width"])
 
         A = float(area_trapezoid(bottom_w=bottom_w, depth=depth, slope_h_over_v=slope_hv))
         V = float(A * pk_step)
@@ -634,7 +650,7 @@ def compute_pk_table_from_landxml(
 
         rows.append({
             "PK": pk_label,
-            "Width_m": width,
+            "Width_m": float(info["width"]),
             "Depth_m": depth,
             "EdgeZ": edge_z,
             "BottomZ": bottom_z,
