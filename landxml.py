@@ -24,17 +24,19 @@ def _iter_by_local(root, local_name: str):
 # ----------------------------
 # Read LandXML TIN from bytes
 # Supports:
-#  - <Surfaces><Surface><Definition surfType="TIN"><Pnts><P id="..">N E Z</P>...</Pnts><Faces><F>...</F></Faces>
-# Output ALWAYS: pts {id: (E,N,Z)}
+#  - <Surfaces><Surface><Definition surfType="TIN"><Pnts><P ...>N E Z</P> ...</Pnts><Faces><F>...</F></Faces>
 # ----------------------------
-def read_landxml_tin_from_bytes(
-    xml_bytes: bytes
-) -> Tuple[Dict[int, Tuple[float, float, float]], List[Tuple[int, int, int]]]:
-
+def read_landxml_tin_from_bytes(xml_bytes: bytes) -> Tuple[Dict[int, Tuple[float, float, float]], List[Tuple[int, int, int]]]:
+    """
+    Returns:
+      pts: {id: (E, N, Z)}  <-- ALWAYS E,N,Z in output
+      faces: [(a,b,c), ...]
+    """
     root = ET.fromstring(xml_bytes)
 
     pts: Dict[int, Tuple[float, float, float]] = {}
 
+    # Prefer Definition/Pnts/P
     for p in _iter_by_local(root, "P"):
         pid = p.get("id")
         txt = (p.text or "").strip()
@@ -48,12 +50,12 @@ def read_landxml_tin_from_bytes(
             b = float(parts[1])
             z = float(parts[2])
             pid_i = int(pid)
-            pts[pid_i] = (a, b, z)  # temp (order fixed below)
+            pts[pid_i] = (a, b, z)  # TEMP, order fixed below
         except Exception:
             continue
 
     if not pts:
-        raise ValueError("LandXML: ei leidnud <P> punkte (Surfaces/Definition/Pnts/P).")
+        raise ValueError("LandXML: ei leidnud <P> punkte (Definition/Pnts/P).")
 
     faces: List[Tuple[int, int, int]] = []
     for f in _iter_by_local(root, "F"):
@@ -70,18 +72,18 @@ def read_landxml_tin_from_bytes(
             continue
 
     if not faces:
-        raise ValueError("LandXML: ei leidnud <F> faces (Surfaces/Definition/Faces/F).")
+        raise ValueError("LandXML: ei leidnud <F> faces (Definition/Faces/F).")
 
     # --- Fix coordinate order ---
-    # Many Estonian files are N E Z; we must output E N Z.
-    arr = np.array(list(pts.values()), dtype=float)
+    # Your file: N E Z (Northing ~ 6.5M, Easting ~ 0.6M)
+    # Output must be E N Z.
+    arr = np.array(list(pts.values()), dtype=float)  # (N?, E?, Z)
     a_med = float(np.median(arr[:, 0]))
     b_med = float(np.median(arr[:, 1]))
-
-    # If first looks like Northing (millions) and second like Easting (hundreds of thousands), swap.
     need_swap = (a_med > 2_000_000.0 and b_med < 2_000_000.0)
+
     if need_swap:
-        pts = {pid: (val[1], val[0], val[2]) for pid, val in pts.items()}
+        pts = {pid: (val[1], val[0], val[2]) for pid, val in pts.items()}  # E,N,Z
 
     return pts, faces
 
@@ -127,11 +129,9 @@ class TinIndex:
     pts_xyz: np.ndarray       # (N,3) full cloud (E,N,Z)
 
 
-def build_tin_index(
-    pts: Dict[int, Tuple[float, float, float]],
-    faces: List[Tuple[int, int, int]],
-    target_bucket_count: int = 150_000
-) -> TinIndex:
+def build_tin_index(pts: Dict[int, Tuple[float, float, float]],
+                    faces: List[Tuple[int, int, int]],
+                    target_bucket_count: int = 150_000) -> TinIndex:
     tris = np.empty((len(faces), 3, 3), dtype=float)
     for i, (a, b, c) in enumerate(faces):
         tris[i, 0, :] = pts[a]
@@ -147,11 +147,7 @@ def build_tin_index(
     cell = math.sqrt(area / max(target_bucket_count, 10_000))
     cell = max(cell, 0.5)
 
-    tri_bbox = np.stack(
-        [xs.min(axis=1), ys.min(axis=1), xs.max(axis=1), ys.max(axis=1)],
-        axis=1
-    )
-
+    tri_bbox = np.stack([xs.min(axis=1), ys.min(axis=1), xs.max(axis=1), ys.max(axis=1)], axis=1)
     tri_buckets = {}
     for i, bb in enumerate(tri_bbox):
         ix0 = int((bb[0] - minx) // cell)
@@ -169,14 +165,12 @@ def build_tin_index(
         iy = int((y - miny) // cell)
         pt_buckets.setdefault((ix, iy), []).append((float(x), float(y), float(z)))
 
-    return TinIndex(
-        tris=tris, minx=minx, miny=miny, cell=cell,
-        tri_buckets=tri_buckets, pt_buckets=pt_buckets,
-        pts_xyz=pts_xyz
-    )
+    return TinIndex(tris=tris, minx=minx, miny=miny, cell=cell,
+                    tri_buckets=tri_buckets, pt_buckets=pt_buckets,
+                    pts_xyz=pts_xyz)
 
 
-def nearest_point_xyz(idx: TinIndex, px: float, py: float, max_rings: int = 10) -> Optional[Tuple[float, float, float]]:
+def nearest_point_xyz(idx: TinIndex, px: float, py: float, max_rings: int = 8) -> Optional[Tuple[float, float, float]]:
     ix = int((px - idx.minx) // idx.cell)
     iy = int((py - idx.miny) // idx.cell)
 
@@ -219,16 +213,16 @@ def z_at_xy(idx: TinIndex, px: float, py: float) -> Optional[float]:
             if z is not None:
                 return z
 
-    nn = nearest_point_xyz(idx, px, py, max_rings=10)
-    return None if nn is None else float(nn[2])
+    nn = nearest_point_xyz(idx, px, py, max_rings=8)
+    if nn is None:
+        return None
+    return float(nn[2])
 
 
-# BACKWARD COMPAT + better helper
 def snap_xy_to_tin(idx: TinIndex, px: float, py: float) -> Tuple[float, float, float]:
-    """Return nearest TIN vertex as (E,N,Z)."""
     nn = nearest_point_xyz(idx, px, py, max_rings=10)
     if nn is None:
-        return float(px), float(py), float("nan")
+        return px, py, float("nan")
     return float(nn[0]), float(nn[1]), float(nn[2])
 
 
@@ -253,15 +247,10 @@ def sample_profile(idx: TinIndex, x1, y1, x2, y2, step) -> Tuple[np.ndarray, np.
     return ds, zs
 
 
-def find_edges_and_depth(
-    ds: np.ndarray,
-    zs: np.ndarray,
-    tol: float,
-    min_run: float,
-    sample_step: float,
-    min_depth_from_bottom: float = 0.3,
-    center_window_m: float = 6.0
-):
+def find_edges_and_depth(ds: np.ndarray, zs: np.ndarray,
+                         tol: float, min_run: float, sample_step: float,
+                         min_depth_from_bottom: float = 0.3,
+                         center_window_m: float = 6.0):
     valid = np.isfinite(zs)
     if valid.sum() < 5:
         return None
@@ -419,7 +408,118 @@ def pk_fmt(meters: int) -> str:
 
 
 # ----------------------------
-# PK table computation
+# Axis import helpers
+# ----------------------------
+def read_axis_polyline_from_csv_bytes(data: bytes) -> List[Tuple[float, float]]:
+    """
+    Accepts CSV/TXT exported from Civil3D:
+      - delimiter: ; or , or whitespace
+      - columns: E N  (or X Y)
+      - may have header row
+    Returns: [(E,N), ...]
+    """
+    text = data.decode("utf-8", errors="ignore")
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        raise ValueError("Teljefail: tühi.")
+
+    # detect delimiter
+    sample = lines[0]
+    if ";" in sample:
+        delim = ";"
+    elif "," in sample:
+        delim = ","
+    else:
+        delim = None
+
+    pts = []
+    for ln in lines:
+        # skip obvious headers
+        low = ln.lower()
+        if any(k in low for k in ["e", "n", "x", "y"]) and any(c.isalpha() for c in low) and not any(ch.isdigit() for ch in low):
+            continue
+
+        if delim:
+            parts = [p.strip() for p in ln.split(delim) if p.strip()]
+        else:
+            parts = ln.replace(",", " ").split()
+
+        if len(parts) < 2:
+            continue
+
+        try:
+            a = float(parts[0])
+            b = float(parts[1])
+            pts.append((a, b))
+        except Exception:
+            continue
+
+    if len(pts) < 2:
+        raise ValueError("Teljefail: ei saanud vähemalt 2 punkti (kontrolli veerge E;N).")
+    return pts
+
+
+def read_axis_from_landxml_alignment_bytes(xml_bytes: bytes) -> List[Tuple[float, float]]:
+    """
+    Very pragmatic LandXML alignment polyline extraction.
+    Reads CoordGeom segments in order:
+      - Line: Start/End
+      - Curve: Start/End
+    Returns polyline [(E,N),...]
+    """
+    root = ET.fromstring(xml_bytes)
+
+    def _read_xy(el) -> Optional[Tuple[float, float]]:
+        if el is None:
+            return None
+        txt = (el.text or "").strip().replace(",", " ")
+        parts = txt.split()
+        if len(parts) < 2:
+            return None
+        try:
+            x = float(parts[0])
+            y = float(parts[1])
+            return (x, y)
+        except Exception:
+            return None
+
+    # find first Alignment CoordGeom
+    coordgeom = None
+    for el in root.iter():
+        if _strip(el.tag).lower() == "coordgeom":
+            coordgeom = el
+            break
+    if coordgeom is None:
+        raise ValueError("Alignment LandXML: ei leidnud <CoordGeom>.")
+
+    pts: List[Tuple[float, float]] = []
+
+    for seg in list(coordgeom):
+        name = _strip(seg.tag).lower()
+        if name in ("line", "curve", "spiral"):
+            st_el = None
+            en_el = None
+            for ch in seg:
+                ln = _strip(ch.tag).lower()
+                if ln == "start":
+                    st_el = ch
+                elif ln == "end":
+                    en_el = ch
+            st_xy = _read_xy(st_el)
+            en_xy = _read_xy(en_el)
+
+            if st_xy and (len(pts) == 0 or (abs(pts[-1][0] - st_xy[0]) > 1e-9 or abs(pts[-1][1] - st_xy[1]) > 1e-9)):
+                pts.append(st_xy)
+            if en_xy:
+                pts.append(en_xy)
+
+    if len(pts) < 2:
+        raise ValueError("Alignment LandXML: ei saanud teljepunkte kätte (Line/Curve Start/End).")
+    return pts
+
+
+# ----------------------------
+# PK table computation from LandXML bytes + axis ABS polyline
 # ----------------------------
 def compute_pk_table_from_landxml(
     xml_bytes: bytes,
@@ -480,7 +580,6 @@ def compute_pk_table_from_landxml(
             })
             continue
 
-        width = float(info["width"])
         depth = float(info["depth"])
         edge_z = float(info["edge_z"])
         bottom_z = float(info["bottom_z"])
@@ -492,7 +591,7 @@ def compute_pk_table_from_landxml(
 
         rows.append({
             "PK": pk_label,
-            "Width_m": width,
+            "Width_m": float(info["width"]),
             "Depth_m": depth,
             "EdgeZ": edge_z,
             "BottomZ": bottom_z,
