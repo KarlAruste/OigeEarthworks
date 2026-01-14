@@ -1,15 +1,22 @@
+# db.py
 import os
 from contextlib import contextmanager
 from datetime import date
-import psycopg
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+
+def _db_url() -> str:
+    url = os.environ.get("DATABASE_URL")
+    if not url:
+        raise RuntimeError("DATABASE_URL missing (Render env var).")
+    # Render võib anda postgres:// - psycopg2 üldiselt sööb selle ära.
+    return url.strip()
+
 
 @contextmanager
 def get_conn():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL missing (Render env var).")
-    conn = psycopg.connect(DATABASE_URL)
+    conn = psycopg2.connect(_db_url(), cursor_factory=RealDictCursor)
     try:
         yield conn
     finally:
@@ -89,7 +96,7 @@ def init_db():
             """
         )
 
-        # Task dependencies (VERY IMPORTANT columns: task_id, dep_task_id)
+        # Task dependencies
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS task_deps (
@@ -100,7 +107,7 @@ def init_db():
             """
         )
 
-        # Reports / cost items
+        # Cost items
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS cost_items (
@@ -113,7 +120,7 @@ def init_db():
             """
         )
 
-        # Production rows (costs based on qty * unit_price)
+        # Productions
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS productions (
@@ -128,7 +135,7 @@ def init_db():
             """
         )
 
-        # Revenue rows
+        # Revenues
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS revenues (
@@ -167,14 +174,14 @@ def list_projects():
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute("SELECT * FROM projects ORDER BY id DESC;")
-        return cur.fetchall()
+        return cur.fetchall()  # list[dict]
 
 
 def get_project(project_id: int):
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute("SELECT * FROM projects WHERE id=%s;", (project_id,))
-        return cur.fetchone()
+        return cur.fetchone()  # dict | None
 
 
 def set_project_top_width(project_id: int, landxml_key: str, top_width_m: float | None):
@@ -191,10 +198,13 @@ def set_project_top_width(project_id: int, landxml_key: str, top_width_m: float 
         conn.commit()
 
 
-def set_project_landxml(project_id: int, landxml_key: str,
-                        planned_volume_m3: float | None,
-                        planned_length_m: float | None,
-                        planned_area_m2: float | None):
+def set_project_landxml(
+    project_id: int,
+    landxml_key: str,
+    planned_volume_m3: float | None,
+    planned_length_m: float | None,
+    planned_area_m2: float | None,
+):
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
@@ -255,8 +265,9 @@ def add_assignment(worker_id: int, project_id: int, start: date, end: date, note
             """,
             (worker_id, start, end),
         )
-        c = cur.fetchone()["c"]
-        if c and int(c) > 0:
+        row = cur.fetchone() or {}
+        c = int(row.get("c") or 0)
+        if c > 0:
             raise Exception("Töötaja on sellel perioodil juba broneeritud teisele objektile.")
 
         cur.execute(
@@ -330,7 +341,6 @@ def add_task(project_id: int, name: str, start_date: date | None = None, end_dat
 def delete_task(task_id: int):
     with get_conn() as conn:
         cur = conn.cursor()
-        # remove dependency links too (both directions)
         cur.execute("DELETE FROM task_deps WHERE task_id=%s OR dep_task_id=%s;", (task_id, task_id))
         cur.execute("DELETE FROM tasks WHERE id=%s;", (task_id,))
         conn.commit()
@@ -363,7 +373,8 @@ def _missing_deps_count(cur, task_id: int) -> int:
         """,
         (task_id,),
     )
-    return int(cur.fetchone()["missing"])
+    row = cur.fetchone() or {}
+    return int(row.get("missing") or 0)
 
 
 def set_task_status(task_id: int, status: str):
@@ -398,20 +409,21 @@ def list_tasks(project_id: int):
             """,
             (project_id,),
         )
-        tasks = cur.fetchall()
+        tasks = cur.fetchall() or []
 
         out = []
         for t in tasks:
-            missing = _missing_deps_count(cur, t["id"])
-            status = t["status"] or "planned"
+            tid = int(t["id"])
+            missing = _missing_deps_count(cur, tid)
+            status = t.get("status") or "planned"
             blocked = (missing > 0) and (status != "done")
             out.append({
                 "id": t["id"],
                 "project_id": t["project_id"],
                 "name": t["name"],
                 "status": status,
-                "start_date": t["start_date"],
-                "end_date": t["end_date"],
+                "start_date": t.get("start_date"),
+                "end_date": t.get("end_date"),
                 "missing_deps": missing,
                 "blocked": blocked,
             })
@@ -475,8 +487,6 @@ def daily_profit_series(project_id: int):
     """
     with get_conn() as conn:
         cur = conn.cursor()
-
-        # costs = sum(qty * unit_price) per day
         cur.execute(
             """
             WITH cost_by_day AS (
@@ -511,5 +521,4 @@ def daily_profit_series(project_id: int):
             """,
             (project_id, project_id),
         )
-
         return cur.fetchall()
