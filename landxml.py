@@ -76,7 +76,7 @@ def read_landxml_tin_from_bytes(data: bytes):
 
 
 # ============================================================
-# TIN geometry + spatial index (from your PyCharm working code)
+# TIN geometry + spatial index
 # ============================================================
 
 def point_in_tri_2d(px, py, ax, ay, bx, by, cx, cy):
@@ -213,7 +213,7 @@ def sample_profile(idx: TinIndex, x1, y1, x2, y2, step):
 
 
 # ============================================================
-# Edge finding (outermost flat edges) - improved
+# Edge finding (outermost flat edges) + max-width guard
 # ============================================================
 
 def find_edges_and_depth(
@@ -224,6 +224,7 @@ def find_edges_and_depth(
     sample_step: float,
     min_depth_from_bottom: float = 0.3,
     center_window_m: float = 6.0,
+    max_width: Optional[float] = None,  # <-- added
 ):
     valid = np.isfinite(zs)
     if valid.sum() < 10:
@@ -279,7 +280,7 @@ def find_edges_and_depth(
     if not left_candidates or not right_candidates:
         return None
 
-    # outermost candidates
+    # outermost candidates (measured width can stick to profile ends)
     left_center, left_edge_z = min(left_candidates, key=lambda t: t[0])
     right_center, right_edge_z = max(right_candidates, key=lambda t: t[0])
 
@@ -287,6 +288,11 @@ def find_edges_and_depth(
         return None
 
     width = float(ds[right_center] - ds[left_center])
+
+    # max-width guard (prevents "profile-end" widths)
+    if (max_width is not None) and (width > float(max_width)):
+        return None
+
     edge_z = float((left_edge_z + right_edge_z) / 2.0)
     depth = float(edge_z - bottom_z)
 
@@ -355,7 +361,6 @@ class ArcSeg:
 Segment = Any  # LineSeg | ArcSeg
 
 def _angle_norm(a: float) -> float:
-    # normalize to [0, 2pi)
     tw = 2.0 * math.pi
     a = a % tw
     if a < 0:
@@ -363,7 +368,6 @@ def _angle_norm(a: float) -> float:
     return a
 
 def _arc_delta(a0: float, a1: float, rot: str) -> float:
-    # positive delta in rotation direction
     a0 = _angle_norm(a0)
     a1 = _angle_norm(a1)
     tw = 2.0 * math.pi
@@ -381,7 +385,6 @@ def _arc_delta(a0: float, a1: float, rot: str) -> float:
 def parse_alignment_from_bytes(data: bytes) -> dict:
     root = etree.fromstring(data)
 
-    aln = None
     alns = _xp(root, ".//lx:Alignments//lx:Alignment")
     if not alns:
         raise ValueError("Alignment LandXML-ist ei leitud <Alignments><Alignment>.")
@@ -397,7 +400,6 @@ def parse_alignment_from_bytes(data: bytes) -> dict:
     if coordgeom is None:
         raise ValueError("Alignment-is puudub <CoordGeom>.")
 
-    # parse in order
     for child in coordgeom:
         tag = _strip(child.tag).lower()
 
@@ -450,14 +452,12 @@ def parse_alignment_from_bytes(data: bytes) -> dict:
             segs.append(ArcSeg(cx=cx, cy=cy, r=r, rot=rot, a0=a0, a1=a1, length=float(L)))
 
         else:
-            # ignore other types
             continue
 
     if not segs:
         raise ValueError("Alignment segmente ei õnnestunud lugeda (Line/Curve).")
 
     total_len = sum(float(s.length) for s in segs)
-    # trust alignment attr if present AND reasonable (Civil's value)
     if aln_len_attr is not None and aln_len_attr > 0:
         total_len = float(aln_len_attr)
 
@@ -476,7 +476,6 @@ def point_and_tangent_at_alignment(aln: dict, s: float) -> Tuple[Tuple[float, fl
     if s >= total:
         s = total
 
-    # traverse by segment "length" (use their length attrs)
     rem = s
     for seg in segs:
         L = float(seg.length)
@@ -484,7 +483,6 @@ def point_and_tangent_at_alignment(aln: dict, s: float) -> Tuple[Tuple[float, fl
             rem -= L
             continue
 
-        # inside this seg at offset rem
         if isinstance(seg, LineSeg):
             t = 0.0 if L <= 0 else rem / L
             x = seg.x0 + t * (seg.x1 - seg.x0)
@@ -495,15 +493,12 @@ def point_and_tangent_at_alignment(aln: dict, s: float) -> Tuple[Tuple[float, fl
             return (float(x), float(y)), (float(tx / nrm), float(ty / nrm))
 
         if isinstance(seg, ArcSeg):
-            # arc param by length: dtheta = rem/r
             dtheta = 0.0 if seg.r <= 0 else (rem / seg.r)
             if seg.rot == "ccw":
                 ang = seg.a0 + dtheta
-                # tangent direction ccw: angle + 90deg
                 tan_ang = ang + math.pi / 2.0
             else:
                 ang = seg.a0 - dtheta
-                # tangent direction cw: angle - 90deg
                 tan_ang = ang - math.pi / 2.0
 
             x = seg.cx + seg.r * math.cos(ang)
@@ -513,17 +508,14 @@ def point_and_tangent_at_alignment(aln: dict, s: float) -> Tuple[Tuple[float, fl
             nrm = math.hypot(tx, ty) or 1.0
             return (float(x), float(y)), (float(tx / nrm), float(ty / nrm))
 
-        # fallback
         break
 
-    # fallback: end of last segment
     last = segs[-1]
     if isinstance(last, LineSeg):
         tx, ty = (last.x1 - last.x0), (last.y1 - last.y0)
         nrm = math.hypot(tx, ty) or 1.0
         return (last.x1, last.y1), (tx / nrm, ty / nrm)
     if isinstance(last, ArcSeg):
-        # end angle depends on rotation: we can just use a1 with tangent
         ang = last.a1
         tan_ang = ang + (math.pi / 2.0 if last.rot == "ccw" else -math.pi / 2.0)
         x = last.cx + last.r * math.cos(ang)
@@ -534,7 +526,9 @@ def point_and_tangent_at_alignment(aln: dict, s: float) -> Tuple[Tuple[float, fl
 
 
 # ============================================================
-# Main PK table computation (volume = area * delta_s)
+# Main PK table computation
+# Variant A: Width_m = theoretical top width (Civil-like)
+# + max-width guard using measured width vs theoretical (+margin)
 # ============================================================
 
 def compute_pk_table(
@@ -566,7 +560,9 @@ def compute_pk_table(
     rows = []
     total_volume = 0.0
 
-    # segment volumes: use pk_step except last partial
+    # margin for max-width sanity check (meters)
+    WIDTH_MARGIN_M = 2.0
+
     for k in range(1, count + 1):
         s = k * pk_step
         (px, py), (tx, ty) = point_and_tangent_at_alignment(aln, s)
@@ -581,6 +577,8 @@ def compute_pk_table(
 
         ds, zs = sample_profile(idx, x1, y1, x2, y2, step=sample_step)
 
+        pk_label = pk_fmt(int(round(s)))
+
         info = find_edges_and_depth(
             ds, zs,
             tol=tol,
@@ -588,14 +586,15 @@ def compute_pk_table(
             sample_step=sample_step,
             min_depth_from_bottom=min_depth_from_bottom,
             center_window_m=min(6.0, cross_len / 3.0),
+            # first hard guard: don't allow widths basically equal to full profile
+            max_width=cross_len * 0.95,
         )
-
-        pk_label = pk_fmt(int(round(s)))
 
         if info is None:
             rows.append({
                 "PK": pk_label,
-                "Width_m": None,
+                "Width_m": None,          # theoretical width
+                "Width_meas_m": None,     # measured from surface (debug)
                 "Depth_m": None,
                 "EdgeZ": None,
                 "BottomZ": None,
@@ -604,15 +603,33 @@ def compute_pk_table(
             })
             continue
 
-        width = float(info["width"])
+        width_meas = float(info["width"])
         depth = float(info["depth"])
         edgez = float(info["edge_z"])
         bottomz = float(info["bottom_z"])
 
+        # Variant A: theoretical top width (matches Civil logic for trapezoid)
+        width_calc = float(bottom_w + 2.0 * slope_hv * depth)
+
+        # second guard: if measured width is way larger than theoretical -> likely wrong edges
+        if width_meas > (width_calc + WIDTH_MARGIN_M):
+            rows.append({
+                "PK": pk_label,
+                "Width_m": None,
+                "Width_meas_m": width_meas,
+                "Depth_m": None,
+                "EdgeZ": None,
+                "BottomZ": None,
+                "Area_m2": None,
+                "Vol_m3": None,
+            })
+            continue
+
+        width = width_calc
+
         A = float(area_trapezoid(bottom_w=bottom_w, depth=depth, slope_h_over_v=slope_hv))
 
         # volume segment length:
-        # for last bin use exact remainder
         if k < count:
             ds_len = pk_step
         else:
@@ -624,7 +641,8 @@ def compute_pk_table(
         total_volume += V
         rows.append({
             "PK": pk_label,
-            "Width_m": width,
+            "Width_m": width,               # theoretical (Civil-like)
+            "Width_meas_m": width_meas,     # measured (debug)
             "Depth_m": depth,
             "EdgeZ": edgez,
             "BottomZ": bottomz,
