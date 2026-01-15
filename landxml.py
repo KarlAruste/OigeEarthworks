@@ -14,10 +14,6 @@ from lxml import etree
 def _strip(tag: str) -> str:
     return tag.split("}")[-1] if "}" in tag else tag
 
-def _nsmap(root):
-    ns_uri = root.nsmap.get(None)
-    return {"lx": ns_uri} if ns_uri else {}
-
 def _xp(root, q: str):
     ns_uri = root.nsmap.get(None)
     ns = {"lx": ns_uri} if ns_uri else {}
@@ -213,8 +209,17 @@ def sample_profile(idx: TinIndex, x1, y1, x2, y2, step):
 
 
 # ============================================================
-# Edge finding (outermost flat edges) + max-width guard
+# Edge finding (REAL ditch edges)
+# 1) Try "first flat plateau" outward from bottom (left/right)
+# 2) Fallback: slope-break (gradient drop) if no plateau exists
 # ============================================================
+
+def _moving_average(x: np.ndarray, w: int) -> np.ndarray:
+    w = max(1, int(w))
+    if w <= 1:
+        return x
+    kernel = np.ones(w, dtype=float) / float(w)
+    return np.convolve(x, kernel, mode="same")
 
 def find_edges_and_depth(
     ds: np.ndarray,
@@ -224,16 +229,39 @@ def find_edges_and_depth(
     sample_step: float,
     min_depth_from_bottom: float = 0.3,
     center_window_m: float = 6.0,
-    max_width: Optional[float] = None,  # <-- added
+
+    # plateau search limits
+    max_edge_dist_m: Optional[float] = None,   # nt 12.0; None = unlimited
+
+    # slope-break fallback parameters
+    slope_threshold: float = 0.12,             # dz/ds (m/m) below this means "almost flat"
+    slope_smooth_window_m: float = 0.5,        # moving average window on slope
+    slope_min_run_m: float = 0.7,              # must stay "almost flat" for this length
 ):
+    """
+    Returns dict with:
+      width, depth, bottom_z, edge_z, left_idx, right_idx, ... etc.
+
+    Plateau method:
+      - find bottom (min Z in center window)
+      - move outward and pick FIRST flat segment (tol, min_run, above bottom+min_depth)
+
+    Fallback slope-break:
+      - compute slope magnitude |dz/ds| and smooth it
+      - find FIRST region where slope < slope_threshold for slope_min_run_m
+        and mean z above bottom+min_depth
+    """
     valid = np.isfinite(zs)
     if valid.sum() < 10:
         return None
 
     n = len(ds)
+    if n < 5:
+        return None
+
     mid = n // 2
 
-    # bottom in center window
+    # ---- find bottom in center window ----
     halfw = max(3, int((center_window_m / sample_step) / 2))
     i0 = max(0, mid - halfw)
     i1 = min(n, mid + halfw + 1)
@@ -248,6 +276,13 @@ def find_edges_and_depth(
         return None
 
     seg_pts = max(5, int(min_run / sample_step) + 1)
+    slope_run_pts = max(5, int(slope_min_run_m / sample_step) + 1)
+    smooth_w = max(1, int(slope_smooth_window_m / sample_step))
+
+    def within_limit(idx_center: int) -> bool:
+        if max_edge_dist_m is None:
+            return True
+        return abs(float(ds[idx_center] - ds[bottom_idx])) <= float(max_edge_dist_m)
 
     def flat_ok(seg_vals: np.ndarray):
         segv = seg_vals[np.isfinite(seg_vals)]
@@ -260,39 +295,123 @@ def find_edges_and_depth(
             return (False, None)
         return (True, m)
 
-    # collect all candidates
-    left_candidates = []
-    for end in range(seg_pts - 1, bottom_idx + 1):
-        seg = zs[end - seg_pts + 1 : end + 1]
-        ok, m = flat_ok(seg)
-        if ok:
+    # ---- 1) Plateau method: FIRST flat segment outward from bottom ----
+    def find_plateau_left():
+        for end in range(bottom_idx, seg_pts - 2, -1):
             center = end - (seg_pts // 2)
-            left_candidates.append((center, m))
+            if center <= 0:
+                continue
+            if not within_limit(center):
+                continue
+            seg = zs[end - seg_pts + 1 : end + 1]
+            ok, m = flat_ok(seg)
+            if ok:
+                return int(center), float(m)
+        return None
 
-    right_candidates = []
-    for start in range(bottom_idx, n - seg_pts + 1):
-        seg = zs[start : start + seg_pts]
-        ok, m = flat_ok(seg)
-        if ok:
+    def find_plateau_right():
+        for start in range(bottom_idx, n - seg_pts + 1):
             center = start + (seg_pts // 2)
-            right_candidates.append((center, m))
-
-    if not left_candidates or not right_candidates:
+            if center >= n:
+                continue
+            if not within_limit(center):
+                continue
+            seg = zs[start : start + seg_pts]
+            ok, m = flat_ok(seg)
+            if ok:
+                return int(center), float(m)
         return None
 
-    # outermost candidates (measured width can stick to profile ends)
-    left_center, left_edge_z = min(left_candidates, key=lambda t: t[0])
-    right_center, right_edge_z = max(right_candidates, key=lambda t: t[0])
+    # ---- 2) Slope-break fallback ----
+    # compute slope magnitude |dz/ds| for finite points
+    # we need continuous-ish arrays; fill NaNs by interpolation to make slope usable
+    def slope_break_find(side: str):
+        z = zs.astype(float).copy()
+        x = ds.astype(float).copy()
 
-    if right_center <= left_center:
+        finite = np.isfinite(z)
+        if finite.sum() < 10:
+            return None
+
+        # interpolate NaNs linearly across ds (only for slope detection)
+        if not finite.all():
+            idxs = np.arange(n)
+            z[~finite] = np.interp(idxs[~finite], idxs[finite], z[finite])
+
+        dz = np.diff(z)
+        dx = np.diff(x)
+        dx[dx == 0] = 1e-9
+        slope = np.abs(dz / dx)  # length n-1
+        slope = _moving_average(slope, smooth_w)
+
+        # helper to validate a run: slope below threshold and elevation above bottom+min_depth
+        def run_ok(start_i: int, end_i: int):
+            # run covers slope indices [start_i:end_i] inclusive in slope array
+            # corresponding z points roughly start_i..end_i+1
+            z_seg = z[start_i : end_i + 2]
+            m = float(np.mean(z_seg))
+            if m < bottom_z + min_depth_from_bottom:
+                return (False, None)
+            return (True, m)
+
+        if side == "left":
+            # search outward: from bottom_idx towards 0
+            # slope index i corresponds between point i and i+1
+            # We want first "almost flat" run while moving left:
+            # check windows that END near bottom and slide outward.
+            # We'll scan candidate windows by their center point distance.
+            for end_pt in range(bottom_idx, slope_run_pts + 1, -1):
+                # slope window ends at end_pt-1 in slope array (between end_pt-1 and end_pt)
+                end_s = end_pt - 1
+                start_s = end_s - slope_run_pts + 1
+                if start_s < 0:
+                    continue
+                center_pt = (start_s + end_s) // 2
+                if not within_limit(center_pt):
+                    continue
+                seg = slope[start_s : end_s + 1]
+                if float(np.max(seg)) <= float(slope_threshold):
+                    ok, m = run_ok(start_s, end_s)
+                    if ok:
+                        return int(center_pt), float(m)
+            return None
+
+        else:
+            # right: from bottom_idx towards n-1
+            for start_pt in range(bottom_idx, (n - 1) - slope_run_pts):
+                start_s = start_pt
+                end_s = start_s + slope_run_pts - 1
+                if end_s >= len(slope):
+                    break
+                center_pt = (start_s + end_s) // 2
+                if not within_limit(center_pt):
+                    continue
+                seg = slope[start_s : end_s + 1]
+                if float(np.max(seg)) <= float(slope_threshold):
+                    ok, m = run_ok(start_s, end_s)
+                    if ok:
+                        return int(center_pt), float(m)
+            return None
+
+    left = find_plateau_left()
+    right = find_plateau_right()
+
+    # Fallbacks if plateau missing
+    if left is None:
+        left = slope_break_find("left")
+    if right is None:
+        right = slope_break_find("right")
+
+    if left is None or right is None:
         return None
 
-    width = float(ds[right_center] - ds[left_center])
+    left_idx, left_edge_z = left
+    right_idx, right_edge_z = right
 
-    # max-width guard (prevents "profile-end" widths)
-    if (max_width is not None) and (width > float(max_width)):
+    if right_idx <= left_idx:
         return None
 
+    width = float(ds[right_idx] - ds[left_idx])
     edge_z = float((left_edge_z + right_edge_z) / 2.0)
     depth = float(edge_z - bottom_z)
 
@@ -304,10 +423,13 @@ def find_edges_and_depth(
         "depth": depth,
         "bottom_z": bottom_z,
         "edge_z": edge_z,
-        "left_s": float(ds[left_center]),
-        "right_s": float(ds[right_center]),
+        "left_s": float(ds[left_idx]),
+        "right_s": float(ds[right_idx]),
         "left_edge_z": float(left_edge_z),
         "right_edge_z": float(right_edge_z),
+        "bottom_idx": int(bottom_idx),
+        "left_idx": int(left_idx),
+        "right_idx": int(right_idx),
     }
 
 
@@ -461,20 +583,13 @@ def parse_alignment_from_bytes(data: bytes) -> dict:
     if aln_len_attr is not None and aln_len_attr > 0:
         total_len = float(aln_len_attr)
 
-    return {
-        "name": aln_name,
-        "segments": segs,
-        "length": float(total_len),
-    }
+    return {"name": aln_name, "segments": segs, "length": float(total_len)}
 
 def point_and_tangent_at_alignment(aln: dict, s: float) -> Tuple[Tuple[float, float], Tuple[float, float]]:
     segs: List[Segment] = aln["segments"]
     total = float(aln["length"])
 
-    if s <= 0:
-        s = 0.0
-    if s >= total:
-        s = total
+    s = max(0.0, min(float(s), total))
 
     rem = s
     for seg in segs:
@@ -514,21 +629,22 @@ def point_and_tangent_at_alignment(aln: dict, s: float) -> Tuple[Tuple[float, fl
     if isinstance(last, LineSeg):
         tx, ty = (last.x1 - last.x0), (last.y1 - last.y0)
         nrm = math.hypot(tx, ty) or 1.0
-        return (last.x1, last.y1), (tx / nrm, ty / nrm)
+        return (float(last.x1), float(last.y1)), (float(tx / nrm), float(ty / nrm))
     if isinstance(last, ArcSeg):
         ang = last.a1
         tan_ang = ang + (math.pi / 2.0 if last.rot == "ccw" else -math.pi / 2.0)
         x = last.cx + last.r * math.cos(ang)
         y = last.cy + last.r * math.sin(ang)
-        return (x, y), (math.cos(tan_ang), math.sin(tan_ang))
+        return (float(x), float(y)), (float(math.cos(tan_ang)), float(math.sin(tan_ang)))
 
     return (0.0, 0.0), (1.0, 0.0)
 
 
 # ============================================================
 # Main PK table computation
-# Variant A: Width_m = theoretical top width (Civil-like)
-# + max-width guard using measured width vs theoretical (+margin)
+# - Width_m: measured REAL ditch edge width (from find_edges_and_depth)
+# - Width_calc_m: theoretical top width from slope+bottom+depth (debug/compare)
+# - Area/Volume: trapezoid from bottom+depth+slope (stable for Civil comparison)
 # ============================================================
 
 def compute_pk_table(
@@ -549,19 +665,15 @@ def compute_pk_table(
         raise ValueError("Ristlõike pikkus ja proovipunkti samm peavad olema > 0.")
 
     slope_hv = parse_slope_ratio(slope_text)
-
     total_len = float(aln["length"])
+
     count = int(math.floor(total_len / pk_step))
     if count <= 0:
         raise ValueError("Telg on lühem kui PK samm.")
 
     half = cross_len / 2.0
-
     rows = []
     total_volume = 0.0
-
-    # margin for max-width sanity check (meters)
-    WIDTH_MARGIN_M = 2.0
 
     for k in range(1, count + 1):
         s = k * pk_step
@@ -576,7 +688,6 @@ def compute_pk_table(
         y2 = py + ny * half
 
         ds, zs = sample_profile(idx, x1, y1, x2, y2, step=sample_step)
-
         pk_label = pk_fmt(int(round(s)))
 
         info = find_edges_and_depth(
@@ -586,15 +697,17 @@ def compute_pk_table(
             sample_step=sample_step,
             min_depth_from_bottom=min_depth_from_bottom,
             center_window_m=min(6.0, cross_len / 3.0),
-            # first hard guard: don't allow widths basically equal to full profile
-            max_width=cross_len * 0.95,
+            max_edge_dist_m=None,          # kui tahad piiri: nt 12.0
+            slope_threshold=0.12,
+            slope_smooth_window_m=0.5,
+            slope_min_run_m=0.7,
         )
 
         if info is None:
             rows.append({
                 "PK": pk_label,
-                "Width_m": None,          # theoretical width
-                "Width_meas_m": None,     # measured from surface (debug)
+                "Width_m": None,
+                "Width_calc_m": None,
                 "Depth_m": None,
                 "EdgeZ": None,
                 "BottomZ": None,
@@ -603,33 +716,15 @@ def compute_pk_table(
             })
             continue
 
-        width_meas = float(info["width"])
+        width = float(info["width"])
         depth = float(info["depth"])
         edgez = float(info["edge_z"])
         bottomz = float(info["bottom_z"])
 
-        # Variant A: theoretical top width (matches Civil logic for trapezoid)
-        width_calc = float(bottom_w + 2.0 * slope_hv * depth)
-
-        # second guard: if measured width is way larger than theoretical -> likely wrong edges
-        if width_meas > (width_calc + WIDTH_MARGIN_M):
-            rows.append({
-                "PK": pk_label,
-                "Width_m": None,
-                "Width_meas_m": width_meas,
-                "Depth_m": None,
-                "EdgeZ": None,
-                "BottomZ": None,
-                "Area_m2": None,
-                "Vol_m3": None,
-            })
-            continue
-
-        width = width_calc
+        width_calc = float(bottom_w + 2.0 * slope_hv * depth)  # compare with Civil theoretical
 
         A = float(area_trapezoid(bottom_w=bottom_w, depth=depth, slope_h_over_v=slope_hv))
 
-        # volume segment length:
         if k < count:
             ds_len = pk_step
         else:
@@ -637,12 +732,12 @@ def compute_pk_table(
             ds_len = max(ds_len, 0.0)
 
         V = float(A * ds_len)
-
         total_volume += V
+
         rows.append({
             "PK": pk_label,
-            "Width_m": width,               # theoretical (Civil-like)
-            "Width_meas_m": width_meas,     # measured (debug)
+            "Width_m": width,              # REAL ditch edge width
+            "Width_calc_m": width_calc,    # theoretical (debug)
             "Depth_m": depth,
             "EdgeZ": edgez,
             "BottomZ": bottomz,
