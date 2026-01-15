@@ -155,3 +155,54 @@ def render_projects_view():
         with c1:
             pk_step = st.number_input("PK samm (m)", min_value=0.1, value=1.0, step=0.1)
             cross_len = st.number_input("Ristlõike kogupikkus (m)", min_value=5.0, value=17.0, step=1.0)
+            sample_step = st.number_input("Proovipunkti samm (m)", min_value=0.02, value=0.10, step=0.01)
+        with c2:
+            tol = st.number_input("Tasase tolerants (m)", min_value=0.01, value=0.05, step=0.01)
+            min_run = st.number_input("Min tasane lõik (m)", min_value=0.05, value=0.20, step=0.05)
+            min_depth = st.number_input("Min kõrgus põhjast (m)", min_value=0.05, value=0.30, step=0.05)
+        with c3:
+            slope_text = st.text_input("Nõlva kalle (nt 1:2)", value="1:2")
+            bottom_w = st.number_input("Põhja laius b (m)", min_value=0.0, value=0.40, step=0.05)
+
+        if st.button("Arvuta PK tabel", use_container_width=True):
+            idx = st.session_state["tin_idx"]
+            rows, total_v, total_len, count = compute_pk_table(
+                idx=idx,
+                aln=aln,
+                pk_step=float(pk_step),
+                cross_len=float(cross_len),
+                sample_step=float(sample_step),
+                tol=float(tol),
+                min_run=float(min_run),
+                min_depth_from_bottom=float(min_depth),
+                slope_text=str(slope_text),
+                bottom_w=float(bottom_w),
+            )
+            df = pd.DataFrame(rows)
+            st.session_state["pk_df"] = df
+            st.session_state["pk_total_v"] = total_v
+            st.session_state["pk_total_len"] = total_len
+            st.session_state["pk_count"] = count
+            st.success("Arvutus tehtud.")
+
+        if "pk_df" in st.session_state:
+            st.markdown("")
+            st.success(f"✅ Kokku maht: {st.session_state['pk_total_v']:.3f} m³")
+            st.caption(f"Telje pikkus (Civil): {st.session_state['pk_total_len']:.3f} m | PK-sid: {st.session_state['pk_count']}")
+
+            df = st.session_state["pk_df"]
+            st.dataframe(df, use_container_width=True, height=420)
+
+            csv = df.to_csv(index=False, sep=";").encode("utf-8")
+            st.download_button("⬇️ Lae alla CSV", data=csv, file_name="pk_tabel.csv", mime="text/csv", use_container_width=True)
+
+        _block_end()
+
+    # ----------------------------------------------------------
+    # Failid (placeholder)
+    # ----------------------------------------------------------
+    with tabs[2]:
+        _block_start()
+        _header("Failid")
+        st.caption("Siia tuleb hiljem R2 failide valik/salvestus (LandXML pinnamudelid jne).")
+        _block_end()
