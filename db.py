@@ -6,6 +6,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 
 
+
 def _db_url() -> str:
     url = os.environ.get("DATABASE_URL")
     if not url:
