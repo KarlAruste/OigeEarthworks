@@ -1,271 +1,93 @@
 # landxml.py
 import math
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Any
 
 import numpy as np
+from lxml import etree
 
 
-# ----------------------------
-# XML helpers
-# ----------------------------
+# ============================================================
+# Helpers
+# ============================================================
+
 def _strip(tag: str) -> str:
     return tag.split("}")[-1] if "}" in tag else tag
 
+def _nsmap(root):
+    ns_uri = root.nsmap.get(None)
+    return {"lx": ns_uri} if ns_uri else {}
 
-def _iter_by_local(root, local_name: str):
-    ln = local_name.lower()
-    for el in root.iter():
-        if _strip(el.tag).lower() == ln:
-            yield el
+def _xp(root, q: str):
+    ns_uri = root.nsmap.get(None)
+    ns = {"lx": ns_uri} if ns_uri else {}
+    return root.xpath(q, namespaces=ns) if ns_uri else root.xpath(q.replace("lx:", ""))
+
+def _as_float_list(text: str) -> List[float]:
+    return [float(x) for x in text.strip().split()]
+
+def _ne_to_en2(n: float, e: float) -> Tuple[float, float]:
+    # File is N,E -> internal X=E, Y=N
+    return float(e), float(n)
+
+def _ne_to_en3(n: float, e: float, z: float) -> Tuple[float, float, float]:
+    x, y = _ne_to_en2(n, e)
+    return x, y, float(z)
+
+def pk_fmt(meters: int) -> str:
+    km = meters // 1000
+    m = meters % 1000
+    return f"{km}+{m:03d}"
 
 
-def _find_first_by_local(root, local_name: str) -> Optional[ET.Element]:
-    for el in _iter_by_local(root, local_name):
-        return el
-    return None
+# ============================================================
+# TIN reader (LandXML Surfaces)
+# LandXML points are assumed as: N E Z  (your files)
+# Internally we store: (E, N, Z)
+# ============================================================
 
+def read_landxml_tin_from_bytes(data: bytes):
+    root = etree.fromstring(data)
 
-# ----------------------------
-# Read LandXML TIN from bytes
-# Supports:
-#  - <Surfaces><Surface><Definition surfType="TIN"><Pnts><P ...>N E Z</P> ...</Pnts><Faces><F>...</F></Faces>
-# Output ALWAYS: pts = {id: (E, N, Z)}
-# ----------------------------
-def read_landxml_tin_from_bytes(
-    xml_bytes: bytes,
-) -> Tuple[Dict[int, Tuple[float, float, float]], List[Tuple[int, int, int]]]:
-    root = ET.fromstring(xml_bytes)
+    p_elems = _xp(root, ".//lx:Surfaces//lx:Surface//lx:Definition//lx:Pnts//lx:P")
+    f_elems = _xp(root, ".//lx:Surfaces//lx:Surface//lx:Definition//lx:Faces//lx:F")
+
+    if not p_elems or not f_elems:
+        raise ValueError("LandXML-ist ei leitud TIN Pnts/Faces (Surfaces/Definition/Pnts/Faces).")
 
     pts: Dict[int, Tuple[float, float, float]] = {}
-
-    # points
-    for p in _iter_by_local(root, "P"):
-        pid = p.get("id")
-        txt = (p.text or "").strip()
-        if not pid or not txt:
+    for p in p_elems:
+        pid = int(p.get("id"))
+        vals = _as_float_list(p.text)
+        if len(vals) < 3:
             continue
-        parts = txt.replace(",", " ").split()
-        if len(parts) < 3:
-            continue
-        try:
-            a = float(parts[0])
-            b = float(parts[1])
-            z = float(parts[2])
-            pts[int(pid)] = (a, b, z)  # order fixed below
-        except Exception:
-            continue
+        n, e, z = vals[0], vals[1], vals[2]  # file: N E Z
+        pts[pid] = _ne_to_en3(n, e, z)
 
-    if not pts:
-        raise ValueError("LandXML: ei leidnud <P> punkte (Definition/Pnts/P).")
-
-    # faces
     faces: List[Tuple[int, int, int]] = []
-    for f in _iter_by_local(root, "F"):
-        txt = (f.text or "").strip()
-        if not txt:
-            continue
-        parts = txt.split()
-        if len(parts) < 3:
-            continue
-        try:
-            faces.append((int(parts[0]), int(parts[1]), int(parts[2])))
-        except Exception:
-            continue
+    for f in f_elems:
+        a, b, c = [int(x) for x in f.text.strip().split()]
+        faces.append((a, b, c))
 
-    if not faces:
-        raise ValueError("LandXML: ei leidnud <F> faces (Definition/Faces/F).")
-
-    # Fix coordinate order heuristic: if first looks like Northing (millions) and second like Easting (hundreds of thousands) -> swap.
-    arr = np.array(list(pts.values()), dtype=float)  # (a,b,z)
-    a_med = float(np.median(arr[:, 0]))
-    b_med = float(np.median(arr[:, 1]))
-
-    need_swap = (a_med > 2_000_000.0 and b_med < 2_000_000.0)
-    if need_swap:
-        pts = {pid: (val[1], val[0], val[2]) for pid, val in pts.items()}  # E,N,Z
+    if len(pts) < 3 or len(faces) < 1:
+        raise ValueError("TIN andmed on liiga väikesed (punkte/faces puudub).")
 
     return pts, faces
 
 
-# ----------------------------
-# Alignment / Axis import
-#  - LandXML Alignment: <Alignments><Alignment length="..." ...><CoordGeom> ... <Line> <Start> <End> ... <Curve> <Start>/<PI>/<End>
-#  - CSV/TXT: columns can be "E;N" or "N;E" or "x,y"
-# Output ALWAYS: [(E,N), ...]
-# ----------------------------
-def _swap_en_if_needed_xy(xy: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
-    if not xy or len(xy) < 2:
-        return xy
-    a = np.array([p[0] for p in xy], dtype=float)
-    b = np.array([p[1] for p in xy], dtype=float)
-    a_med = float(np.median(a))
-    b_med = float(np.median(b))
-    # Typical Estonia: N ~ 6.x million, E ~ 0.3..0.8 million
-    need_swap = (a_med > 2_000_000.0 and b_med < 2_000_000.0)
-    if need_swap:
-        return [(y, x) for (x, y) in xy]
-    return xy
+# ============================================================
+# TIN geometry + spatial index (from your PyCharm working code)
+# ============================================================
 
-
-def read_axis_from_bytes(
-    data: bytes,
-    filename: str,
-    force_swap_en: bool = False,
-) -> Dict[str, Any]:
-    """
-    Returns dict:
-      {
-        "axis_xy": [(E,N),...],
-        "axis_length_m": float,    # computed from points
-        "declared_length_m": float|None,  # from Alignment length attr if present
-        "source": "landxml_alignment"|"csv_txt"
-      }
-    """
-    name = (filename or "").lower().strip()
-
-    # ---- try LandXML Alignment ----
-    if name.endswith(".xml") or name.endswith(".landxml"):
-        try:
-            root = ET.fromstring(data)
-
-            # find first Alignment
-            align = None
-            for a in _iter_by_local(root, "Alignment"):
-                align = a
-                break
-
-            if align is not None:
-                declared = align.get("length")
-                declared_len = float(declared) if declared not in (None, "") else None
-
-                # Gather points from CoordGeom
-                # We prefer explicit Start/End points of each element. This gives a dense enough polyline for straight segments.
-                axis: List[Tuple[float, float]] = []
-
-                coord = None
-                for cg in align.iter():
-                    if _strip(cg.tag).lower() == "coordgeom":
-                        coord = cg
-                        break
-
-                if coord is None:
-                    # fallback: sometimes alignment points are in <CoordGeom> but namespace issues; try local scan
-                    coord = _find_first_by_local(align, "CoordGeom")
-
-                if coord is None:
-                    raise ValueError("Alignment leitud, aga <CoordGeom> puudub.")
-
-                def _parse_xy(text: str) -> Tuple[float, float]:
-                    parts = (text or "").strip().replace(",", " ").split()
-                    if len(parts) < 2:
-                        raise ValueError("Coord text invalid")
-                    return float(parts[0]), float(parts[1])
-
-                # iterate geometry primitives
-                for child in list(coord):
-                    tag = _strip(child.tag).lower()
-                    if tag in ("line", "curve", "spiral"):
-                        start_el = _find_first_by_local(child, "Start")
-                        end_el = _find_first_by_local(child, "End")
-                        pi_el = _find_first_by_local(child, "PI")
-
-                        # Add Start
-                        if start_el is not None and (start_el.text or "").strip():
-                            axis.append(_parse_xy(start_el.text))
-
-                        # Some curves include PI point; add it for better shape
-                        if pi_el is not None and (pi_el.text or "").strip():
-                            axis.append(_parse_xy(pi_el.text))
-
-                        # Add End
-                        if end_el is not None and (end_el.text or "").strip():
-                            axis.append(_parse_xy(end_el.text))
-
-                # de-duplicate consecutive identical points
-                cleaned: List[Tuple[float, float]] = []
-                for p in axis:
-                    if not cleaned:
-                        cleaned.append(p)
-                    else:
-                        if (abs(cleaned[-1][0] - p[0]) > 1e-9) or (abs(cleaned[-1][1] - p[1]) > 1e-9):
-                            cleaned.append(p)
-
-                if len(cleaned) < 2:
-                    raise ValueError("Alignmentist ei õnnestunud lugeda piisavalt punkte (vähemalt 2).")
-
-                # Heuristic swap to E,N + optional force swap
-                cleaned = _swap_en_if_needed_xy(cleaned)
-                if force_swap_en:
-                    cleaned = [(y, x) for (x, y) in cleaned]
-
-                return {
-                    "axis_xy": cleaned,
-                    "axis_length_m": polyline_length(cleaned),
-                    "declared_length_m": declared_len,
-                    "source": "landxml_alignment",
-                }
-        except Exception:
-            # fall through to CSV/TXT
-            pass
-
-    # ---- CSV/TXT points ----
-    txt = data.decode("utf-8", errors="ignore").strip()
-    if not txt:
-        raise ValueError("Telje fail on tühi.")
-
-    lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
-    axis: List[Tuple[float, float]] = []
-
-    # detect separator
-    # allow: "E;N", "E,N", "E N"
-    for ln in lines:
-        # skip header-ish
-        low = ln.lower()
-        if any(k in low for k in ("e;", "n;", "e,n", "north", "east", "x;", "y;", "x,", "y,")) and not any(ch.isdigit() for ch in ln):
-            continue
-
-        s = ln.replace("\t", " ").replace(",", " ").replace(";", " ")
-        parts = [p for p in s.split() if p]
-        if len(parts) < 2:
-            continue
-        try:
-            a = float(parts[0])
-            b = float(parts[1])
-            axis.append((a, b))
-        except Exception:
-            continue
-
-    if len(axis) < 2:
-        raise ValueError("Telje failist ei saanud lugeda punkte. Ootan CSV/TXT kujul: E;N või N;E.")
-
-    axis = _swap_en_if_needed_xy(axis)
-    if force_swap_en:
-        axis = [(y, x) for (x, y) in axis]
-
-    return {
-        "axis_xy": axis,
-        "axis_length_m": polyline_length(axis),
-        "declared_length_m": None,
-        "source": "csv_txt",
-    }
-
-
-# ----------------------------
-# Geometry / TIN index
-# ----------------------------
-def _point_in_tri_2d(px, py, ax, ay, bx, by, cx, cy) -> bool:
+def point_in_tri_2d(px, py, ax, ay, bx, by, cx, cy):
     def s(x1, y1, x2, y2, x3, y3):
         return (x1 - x3) * (y2 - y3) - (x2 - x3) * (y1 - y3)
-
     b1 = s(px, py, ax, ay, bx, by) < 0.0
     b2 = s(px, py, bx, by, cx, cy) < 0.0
     b3 = s(px, py, cx, cy, ax, ay) < 0.0
     return (b1 == b2) and (b2 == b3)
 
-
-def _interp_z(px, py, A, B, C) -> Optional[float]:
+def interp_z(px, py, A, B, C):
     ax, ay, az = A
     bx, by, bz = B
     cx, cy, cz = C
@@ -279,25 +101,18 @@ def _interp_z(px, py, A, B, C) -> Optional[float]:
     if abs(nz) < 1e-12:
         return None
 
-    return float(az - (nx * (px - ax) + ny * (py - ay)) / nz)
-
+    return az - (nx * (px - ax) + ny * (py - ay)) / nz
 
 @dataclass
 class TinIndex:
-    tris: np.ndarray          # (T,3,3) points (E,N,Z)
+    tris: np.ndarray
     minx: float
     miny: float
     cell: float
-    tri_buckets: dict         # (ix,iy)->[tri_idx]
-    pt_buckets: dict          # (ix,iy)->[(E,N,Z),...]
-    pts_xyz: np.ndarray       # (N,3) full cloud (E,N,Z)
+    tri_buckets: dict
+    pt_buckets: dict
 
-
-def build_tin_index(
-    pts: Dict[int, Tuple[float, float, float]],
-    faces: List[Tuple[int, int, int]],
-    target_bucket_count: int = 150_000,
-) -> TinIndex:
+def build_tin_index(pts, faces, target_bucket_count=150_000):
     tris = np.empty((len(faces), 3, 3), dtype=float)
     for i, (a, b, c) in enumerate(faces):
         tris[i, 0, :] = pts[a]
@@ -325,24 +140,19 @@ def build_tin_index(
                 tri_buckets.setdefault((ix, iy), []).append(i)
 
     pt_buckets = {}
-    pts_xyz = np.array(list(pts.values()), dtype=float)
-    for (x, y, z) in pts_xyz:
+    for (x, y, z) in pts.values():
         ix = int((x - minx) // cell)
         iy = int((y - miny) // cell)
         pt_buckets.setdefault((ix, iy), []).append((float(x), float(y), float(z)))
 
-    return TinIndex(
-        tris=tris, minx=minx, miny=miny, cell=cell,
-        tri_buckets=tri_buckets, pt_buckets=pt_buckets, pts_xyz=pts_xyz
-    )
+    return TinIndex(tris=tris, minx=minx, miny=miny, cell=cell, tri_buckets=tri_buckets, pt_buckets=pt_buckets)
 
-
-def nearest_point_xyz(idx: TinIndex, px: float, py: float, max_rings: int = 8) -> Optional[Tuple[float, float, float]]:
+def nearest_point_z(idx: TinIndex, px: float, py: float, max_rings: int = 6):
     ix = int((px - idx.minx) // idx.cell)
     iy = int((py - idx.miny) // idx.cell)
 
     best_d2 = None
-    best = None
+    best_z = None
 
     for r in range(0, max_rings + 1):
         found_any = False
@@ -358,41 +168,35 @@ def nearest_point_xyz(idx: TinIndex, px: float, py: float, max_rings: int = 8) -
                     d2 = (x - px) ** 2 + (y - py) ** 2
                     if best_d2 is None or d2 < best_d2:
                         best_d2 = d2
-                        best = (x, y, z)
-        if found_any and best is not None:
-            return best
+                        best_z = z
+        if found_any and best_z is not None:
+            return float(best_z)
+
     return None
 
-
-def z_at_xy(idx: TinIndex, px: float, py: float) -> Optional[float]:
+def z_at_xy(idx: TinIndex, px: float, py: float):
     ix = int((px - idx.minx) // idx.cell)
     iy = int((py - idx.miny) // idx.cell)
 
-    candidates: List[int] = []
+    candidates = []
     for dx in (0, -1, 1):
         for dy in (0, -1, 1):
             candidates += idx.tri_buckets.get((ix + dx, iy + dy), [])
 
     for ti in candidates:
         A, B, C = idx.tris[ti]
-        if _point_in_tri_2d(px, py, A[0], A[1], B[0], B[1], C[0], C[1]):
-            z = _interp_z(px, py, A, B, C)
+        if point_in_tri_2d(px, py, A[0], A[1], B[0], B[1], C[0], C[1]):
+            z = interp_z(px, py, A, B, C)
             if z is not None:
-                return z
+                return float(z)
 
-    nn = nearest_point_xyz(idx, px, py, max_rings=8)
-    if nn is None:
-        return None
-    return float(nn[2])
+    return nearest_point_z(idx, px, py, max_rings=6)
 
-
-# ----------------------------
-# Profiles + edges/depth
-# ----------------------------
-def sample_profile(idx: TinIndex, x1, y1, x2, y2, step) -> Tuple[np.ndarray, np.ndarray]:
+def sample_profile(idx: TinIndex, x1, y1, x2, y2, step):
     L = math.hypot(x2 - x1, y2 - y1)
     if L < 1e-9:
         raise ValueError("Ristlõike joon on liiga lühike.")
+
     n = max(2, int(L / step) + 1)
     ds = np.linspace(0.0, L, n)
 
@@ -404,8 +208,13 @@ def sample_profile(idx: TinIndex, x1, y1, x2, y2, step) -> Tuple[np.ndarray, np.
         z = z_at_xy(idx, px, py)
         if z is not None:
             zs[i] = z
+
     return ds, zs
 
+
+# ============================================================
+# Edge finding (outermost flat edges) - improved
+# ============================================================
 
 def find_edges_and_depth(
     ds: np.ndarray,
@@ -415,255 +224,354 @@ def find_edges_and_depth(
     sample_step: float,
     min_depth_from_bottom: float = 0.3,
     center_window_m: float = 6.0,
-    fallback_mode: str = "robust",   # "none" | "robust"
 ):
-    """
-    Tagastab dict:
-      width, depth, bottom_z, edge_z, left_s, right_s, left_edge_z, right_edge_z, method
-
-    method:
-      - "flat"    -> leiti tasased servad
-      - "robust"  -> fallback (percentile top + min bottom)
-      - None      -> ei õnnestunud
-    """
     valid = np.isfinite(zs)
-    if valid.sum() < 5:
+    if valid.sum() < 10:
         return None
 
     n = len(ds)
     mid = n // 2
 
-    # --- bottom near center window (as before) ---
-    halfw = max(2, int((center_window_m / sample_step) / 2))
+    # bottom in center window
+    halfw = max(3, int((center_window_m / sample_step) / 2))
     i0 = max(0, mid - halfw)
     i1 = min(n, mid + halfw + 1)
-
-    if valid[i0:i1].sum() < 3:
+    if valid[i0:i1].sum() < 5:
         i0, i1 = 0, n
 
     sub = zs[i0:i1].copy()
     sub[~np.isfinite(sub)] = np.inf
     bottom_idx = i0 + int(np.argmin(sub))
     bottom_z = float(zs[bottom_idx])
+    if not math.isfinite(bottom_z):
+        return None
 
-    seg_pts = max(3, int(min_run / sample_step) + 1)
+    seg_pts = max(5, int(min_run / sample_step) + 1)
 
-    def is_edge_flat(seg):
-        segv = seg[np.isfinite(seg)]
-        if len(segv) < 2:
-            return False, None
+    def flat_ok(seg_vals: np.ndarray):
+        segv = seg_vals[np.isfinite(seg_vals)]
+        if len(segv) < max(3, seg_pts // 2):
+            return (False, None)
         if float(segv.max() - segv.min()) > tol:
-            return False, None
+            return (False, None)
         m = float(segv.mean())
         if m < bottom_z + min_depth_from_bottom:
-            return False, None
-        return True, m
+            return (False, None)
+        return (True, m)
 
-    # --- try FLAT edges (original logic) ---
-    left_center = None
-    left_edge_z = None
-    for end in range(bottom_idx, seg_pts - 1, -1):
-        seg = zs[end - seg_pts + 1:end + 1]
-        ok, m = is_edge_flat(seg)
+    # collect all candidates
+    left_candidates = []
+    for end in range(seg_pts - 1, bottom_idx + 1):
+        seg = zs[end - seg_pts + 1 : end + 1]
+        ok, m = flat_ok(seg)
         if ok:
-            left_center = end - (seg_pts // 2)
-            left_edge_z = m
-            break
+            center = end - (seg_pts // 2)
+            left_candidates.append((center, m))
 
-    right_center = None
-    right_edge_z = None
-    for start in range(bottom_idx, n - seg_pts):
-        seg = zs[start:start + seg_pts]
-        ok, m = is_edge_flat(seg)
+    right_candidates = []
+    for start in range(bottom_idx, n - seg_pts + 1):
+        seg = zs[start : start + seg_pts]
+        ok, m = flat_ok(seg)
         if ok:
-            right_center = start + (seg_pts // 2)
-            right_edge_z = m
-            break
+            center = start + (seg_pts // 2)
+            right_candidates.append((center, m))
 
-    if left_center is not None and right_center is not None and left_edge_z is not None and right_edge_z is not None:
-        width = float(ds[right_center] - ds[left_center])
-        if width <= 0:
-            return None
-        edge_z = float((left_edge_z + right_edge_z) / 2.0)
-        depth = float(edge_z - bottom_z)
-        if depth <= 0:
-            return None
-        return {
-            "width": width,
-            "depth": depth,
-            "bottom_z": bottom_z,
-            "edge_z": edge_z,
-            "left_s": float(ds[left_center]),
-            "right_s": float(ds[right_center]),
-            "left_edge_z": float(left_edge_z),
-            "right_edge_z": float(right_edge_z),
-            "method": "flat",
-        }
-
-    # --- FALLBACK ---
-    if fallback_mode != "robust":
+    if not left_candidates or not right_candidates:
         return None
 
-    zsv = zs[np.isfinite(zs)]
-    if zsv.size < 5:
+    # outermost candidates
+    left_center, left_edge_z = min(left_candidates, key=lambda t: t[0])
+    right_center, right_edge_z = max(right_candidates, key=lambda t: t[0])
+
+    if right_center <= left_center:
         return None
 
-    # robust edge level = top percentile (p90)
-    edge_z = float(np.percentile(zsv, 90))
-    bottom_z2 = float(np.min(zsv))
-    depth = float(edge_z - bottom_z2)
-    if depth <= 0:
-        return None
+    width = float(ds[right_center] - ds[left_center])
+    edge_z = float((left_edge_z + right_edge_z) / 2.0)
+    depth = float(edge_z - bottom_z)
 
-    # estimate width: span where z is near "edge_z"
-    # threshold: within (tol*2) below edge_z
-    thr = edge_z - max(tol * 2.0, 0.05)
-    idxs = np.where((np.isfinite(zs)) & (zs >= thr))[0]
-    if idxs.size >= 2:
-        left_i = int(idxs[0])
-        right_i = int(idxs[-1])
-        width = float(ds[right_i] - ds[left_i])
-        left_s = float(ds[left_i])
-        right_s = float(ds[right_i])
-    else:
-        # if can't estimate, use full cross length
-        width = float(ds[-1] - ds[0])
-        left_s = float(ds[0])
-        right_s = float(ds[-1])
+    if width <= 0 or depth <= 0:
+        return None
 
     return {
         "width": width,
         "depth": depth,
-        "bottom_z": bottom_z2,
+        "bottom_z": bottom_z,
         "edge_z": edge_z,
-        "left_s": left_s,
-        "right_s": right_s,
-        "left_edge_z": edge_z,
-        "right_edge_z": edge_z,
-        "method": "robust",
+        "left_s": float(ds[left_center]),
+        "right_s": float(ds[right_center]),
+        "left_edge_z": float(left_edge_z),
+        "right_edge_z": float(right_edge_z),
     }
 
 
-
-# ----------------------------
+# ============================================================
 # Slope + area
-# ----------------------------
+# ============================================================
+
 def parse_slope_ratio(text: str) -> float:
+    """
+    '1:2' -> 2.0 (H/V)
+    """
     t = text.strip().replace(" ", "")
     if ":" in t:
         a, b = t.split(":", 1)
         v = float(a)
         h = float(b)
         if v == 0:
-            raise ValueError("Nõlv 1:n: vertikaal ei tohi olla 0")
+            raise ValueError("Nõlva kalle: vertikaal ei tohi olla 0")
         return h / v
     return float(t)
-
 
 def area_trapezoid(bottom_w: float, depth: float, slope_h_over_v: float) -> float:
     top_w = bottom_w + 2.0 * slope_h_over_v * depth
     return (bottom_w + top_w) * 0.5 * depth
 
 
-# ----------------------------
-# Polyline helpers (ABS coords!)
-# ----------------------------
-def polyline_cumlen(xy: List[Tuple[float, float]]) -> np.ndarray:
-    cum = [0.0]
-    for i in range(len(xy) - 1):
-        dx = xy[i + 1][0] - xy[i][0]
-        dy = xy[i + 1][1] - xy[i][1]
-        cum.append(cum[-1] + math.hypot(dx, dy))
-    return np.array(cum, dtype=float)
+# ============================================================
+# Alignment parser (Civil3D LandXML)
+# Uses CoordGeom Line + Curve. Uses element length attributes.
+# File coords are N E, internally store E,N
+# ============================================================
 
+@dataclass
+class LineSeg:
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+    length: float
 
-def polyline_length(xy: List[Tuple[float, float]]) -> float:
-    if len(xy) < 2:
-        return 0.0
-    return float(polyline_cumlen(xy)[-1])
+@dataclass
+class ArcSeg:
+    cx: float
+    cy: float
+    r: float
+    rot: str  # "cw" or "ccw"
+    a0: float
+    a1: float
+    length: float
 
+Segment = Any  # LineSeg | ArcSeg
 
-def point_and_tangent_at(xy: List[Tuple[float, float]], s: float):
-    cum = polyline_cumlen(xy)
-    total = float(cum[-1])
+def _angle_norm(a: float) -> float:
+    # normalize to [0, 2pi)
+    tw = 2.0 * math.pi
+    a = a % tw
+    if a < 0:
+        a += tw
+    return a
+
+def _arc_delta(a0: float, a1: float, rot: str) -> float:
+    # positive delta in rotation direction
+    a0 = _angle_norm(a0)
+    a1 = _angle_norm(a1)
+    tw = 2.0 * math.pi
+    if rot == "ccw":
+        d = a1 - a0
+        if d < 0:
+            d += tw
+        return d
+    else:
+        d = a0 - a1
+        if d < 0:
+            d += tw
+        return d
+
+def parse_alignment_from_bytes(data: bytes) -> dict:
+    root = etree.fromstring(data)
+
+    aln = None
+    alns = _xp(root, ".//lx:Alignments//lx:Alignment")
+    if not alns:
+        raise ValueError("Alignment LandXML-ist ei leitud <Alignments><Alignment>.")
+    aln = alns[0]
+
+    aln_name = aln.get("name") or "Alignment"
+    aln_len_attr = aln.get("length")
+    aln_len_attr = float(aln_len_attr) if aln_len_attr else None
+
+    segs: List[Segment] = []
+
+    coordgeom = _xp(aln, ".//lx:CoordGeom")[0] if _xp(aln, ".//lx:CoordGeom") else None
+    if coordgeom is None:
+        raise ValueError("Alignment-is puudub <CoordGeom>.")
+
+    # parse in order
+    for child in coordgeom:
+        tag = _strip(child.tag).lower()
+
+        if tag == "line":
+            L = child.get("length")
+            L = float(L) if L else None
+
+            start = _xp(child, ".//lx:Start")
+            end = _xp(child, ".//lx:End")
+            if not start or not end:
+                continue
+
+            n0, e0 = _as_float_list(start[0].text)[:2]
+            n1, e1 = _as_float_list(end[0].text)[:2]
+            x0, y0 = _ne_to_en2(n0, e0)
+            x1, y1 = _ne_to_en2(n1, e1)
+
+            if L is None:
+                L = math.hypot(x1 - x0, y1 - y0)
+
+            segs.append(LineSeg(x0=x0, y0=y0, x1=x1, y1=y1, length=float(L)))
+
+        elif tag == "curve":
+            rot = (child.get("rot") or "ccw").lower()
+            r = float(child.get("radius") or "0")
+            L = child.get("length")
+            L = float(L) if L else None
+
+            start = _xp(child, ".//lx:Start")
+            end = _xp(child, ".//lx:End")
+            center = _xp(child, ".//lx:Center")
+            if not start or not end or not center or r <= 0:
+                continue
+
+            n0, e0 = _as_float_list(start[0].text)[:2]
+            n1, e1 = _as_float_list(end[0].text)[:2]
+            nc, ec = _as_float_list(center[0].text)[:2]
+
+            x0, y0 = _ne_to_en2(n0, e0)
+            x1, y1 = _ne_to_en2(n1, e1)
+            cx, cy = _ne_to_en2(nc, ec)
+
+            a0 = math.atan2(y0 - cy, x0 - cx)
+            a1 = math.atan2(y1 - cy, x1 - cx)
+
+            d = _arc_delta(a0, a1, rot)
+            if L is None:
+                L = abs(r * d)
+
+            segs.append(ArcSeg(cx=cx, cy=cy, r=r, rot=rot, a0=a0, a1=a1, length=float(L)))
+
+        else:
+            # ignore other types
+            continue
+
+    if not segs:
+        raise ValueError("Alignment segmente ei õnnestunud lugeda (Line/Curve).")
+
+    total_len = sum(float(s.length) for s in segs)
+    # trust alignment attr if present AND reasonable (Civil's value)
+    if aln_len_attr is not None and aln_len_attr > 0:
+        total_len = float(aln_len_attr)
+
+    return {
+        "name": aln_name,
+        "segments": segs,
+        "length": float(total_len),
+    }
+
+def point_and_tangent_at_alignment(aln: dict, s: float) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    segs: List[Segment] = aln["segments"]
+    total = float(aln["length"])
 
     if s <= 0:
-        x0, y0 = xy[0]
-        x1, y1 = xy[1]
-        tx, ty = x1 - x0, y1 - y0
-        L = math.hypot(tx, ty) or 1.0
-        return (x0, y0), (tx / L, ty / L)
-
+        s = 0.0
     if s >= total:
-        x0, y0 = xy[-2]
-        x1, y1 = xy[-1]
-        tx, ty = x1 - x0, y1 - y0
-        L = math.hypot(tx, ty) or 1.0
-        return (x1, y1), (tx / L, ty / L)
+        s = total
 
-    i = int(np.searchsorted(cum, s, side="right") - 1)
-    i = max(0, min(i, len(xy) - 2))
+    # traverse by segment "length" (use their length attrs)
+    rem = s
+    for seg in segs:
+        L = float(seg.length)
+        if rem > L:
+            rem -= L
+            continue
 
-    s0 = cum[i]
-    s1 = cum[i + 1]
-    segL = s1 - s0
-    t = (s - s0) / segL if segL > 0 else 0.0
+        # inside this seg at offset rem
+        if isinstance(seg, LineSeg):
+            t = 0.0 if L <= 0 else rem / L
+            x = seg.x0 + t * (seg.x1 - seg.x0)
+            y = seg.y0 + t * (seg.y1 - seg.y0)
+            tx = (seg.x1 - seg.x0)
+            ty = (seg.y1 - seg.y0)
+            nrm = math.hypot(tx, ty) or 1.0
+            return (float(x), float(y)), (float(tx / nrm), float(ty / nrm))
 
-    x0, y0 = xy[i]
-    x1, y1 = xy[i + 1]
-    px = x0 + t * (x1 - x0)
-    py = y0 + t * (y1 - y0)
+        if isinstance(seg, ArcSeg):
+            # arc param by length: dtheta = rem/r
+            dtheta = 0.0 if seg.r <= 0 else (rem / seg.r)
+            if seg.rot == "ccw":
+                ang = seg.a0 + dtheta
+                # tangent direction ccw: angle + 90deg
+                tan_ang = ang + math.pi / 2.0
+            else:
+                ang = seg.a0 - dtheta
+                # tangent direction cw: angle - 90deg
+                tan_ang = ang - math.pi / 2.0
 
-    tx, ty = (x1 - x0), (y1 - y0)
-    L = math.hypot(tx, ty) or 1.0
-    return (px, py), (tx / L, ty / L)
+            x = seg.cx + seg.r * math.cos(ang)
+            y = seg.cy + seg.r * math.sin(ang)
+            tx = math.cos(tan_ang)
+            ty = math.sin(tan_ang)
+            nrm = math.hypot(tx, ty) or 1.0
+            return (float(x), float(y)), (float(tx / nrm), float(ty / nrm))
+
+        # fallback
+        break
+
+    # fallback: end of last segment
+    last = segs[-1]
+    if isinstance(last, LineSeg):
+        tx, ty = (last.x1 - last.x0), (last.y1 - last.y0)
+        nrm = math.hypot(tx, ty) or 1.0
+        return (last.x1, last.y1), (tx / nrm, ty / nrm)
+    if isinstance(last, ArcSeg):
+        # end angle depends on rotation: we can just use a1 with tangent
+        ang = last.a1
+        tan_ang = ang + (math.pi / 2.0 if last.rot == "ccw" else -math.pi / 2.0)
+        x = last.cx + last.r * math.cos(ang)
+        y = last.cy + last.r * math.sin(ang)
+        return (x, y), (math.cos(tan_ang), math.sin(tan_ang))
+
+    return (0.0, 0.0), (1.0, 0.0)
 
 
-def pk_fmt(meters: int) -> str:
-    km = meters // 1000
-    m = meters % 1000
-    if meters < 100:
-        return f"{km}+{m:02d}"
-    return f"{km}+{m:03d}"
+# ============================================================
+# Main PK table computation (volume = area * delta_s)
+# ============================================================
 
-
-# ----------------------------
-# PK table computation from LandXML bytes + axis ABS polyline
-# ----------------------------
-def compute_pk_table_from_landxml(
-    xml_bytes: bytes,
-    axis_xy_abs: Optional[List[Tuple[float, float]]] = None,
-    axis_xy: Optional[List[Tuple[float, float]]] = None,  # backwards compat
-    pk_step: float = 1.0,
-    cross_len: float = 25.0,
-    sample_step: float = 0.1,
-    tol: float = 0.05,
-    min_run: float = 0.2,
-    min_depth_from_bottom: float = 0.3,
-    slope_text: str = "1:2",
-    bottom_w: float = 0.40,
+def compute_pk_table(
+    idx: TinIndex,
+    aln: dict,
+    pk_step: float,
+    cross_len: float,
+    sample_step: float,
+    tol: float,
+    min_run: float,
+    min_depth_from_bottom: float,
+    slope_text: str,
+    bottom_w: float,
 ):
-    if axis_xy_abs is None:
-        axis_xy_abs = axis_xy or []
-    if len(axis_xy_abs) < 2:
-        raise ValueError("Telg peab olema vähemalt 2 punktiga.")
+    if pk_step <= 0:
+        raise ValueError("PK samm peab olema > 0.")
+    if cross_len <= 0 or sample_step <= 0:
+        raise ValueError("Ristlõike pikkus ja proovipunkti samm peavad olema > 0.")
 
-    pts, faces = read_landxml_tin_from_bytes(xml_bytes)
-    idx = build_tin_index(pts, faces)
     slope_hv = parse_slope_ratio(slope_text)
 
-    total_len = polyline_length(axis_xy_abs)
+    total_len = float(aln["length"])
     count = int(math.floor(total_len / pk_step))
+    if count <= 0:
+        raise ValueError("Telg on lühem kui PK samm.")
+
     half = cross_len / 2.0
 
     rows = []
     total_volume = 0.0
 
+    # segment volumes: use pk_step except last partial
     for k in range(1, count + 1):
         s = k * pk_step
-        (px, py), (tx, ty) = point_and_tangent_at(axis_xy_abs, s)
+        (px, py), (tx, ty) = point_and_tangent_at_alignment(aln, s)
 
-        # normal
+        # normal (left/right)
         nx, ny = -ty, tx
 
         x1 = px - nx * half
@@ -672,6 +580,7 @@ def compute_pk_table_from_landxml(
         y2 = py + ny * half
 
         ds, zs = sample_profile(idx, x1, y1, x2, y2, step=sample_step)
+
         info = find_edges_and_depth(
             ds, zs,
             tol=tol,
@@ -679,7 +588,6 @@ def compute_pk_table_from_landxml(
             sample_step=sample_step,
             min_depth_from_bottom=min_depth_from_bottom,
             center_window_m=min(6.0, cross_len / 3.0),
-            fallback_mode="robust",
         )
 
         pk_label = pk_fmt(int(round(s)))
@@ -696,27 +604,32 @@ def compute_pk_table_from_landxml(
             })
             continue
 
+        width = float(info["width"])
         depth = float(info["depth"])
-        edge_z = float(info["edge_z"])
-        bottom_z = float(info["bottom_z"])
+        edgez = float(info["edge_z"])
+        bottomz = float(info["bottom_z"])
 
         A = float(area_trapezoid(bottom_w=bottom_w, depth=depth, slope_h_over_v=slope_hv))
-        V = float(A * pk_step)
-        total_volume += V
 
+        # volume segment length:
+        # for last bin use exact remainder
+        if k < count:
+            ds_len = pk_step
+        else:
+            ds_len = total_len - (pk_step * (count - 1))
+            ds_len = max(ds_len, 0.0)
+
+        V = float(A * ds_len)
+
+        total_volume += V
         rows.append({
             "PK": pk_label,
-            "Width_m": float(info["width"]),
+            "Width_m": width,
             "Depth_m": depth,
-            "EdgeZ": edge_z,
-            "BottomZ": bottom_z,
+            "EdgeZ": edgez,
+            "BottomZ": bottomz,
             "Area_m2": A,
             "Vol_m3": V,
         })
 
-    return {
-        "rows": rows,
-        "count": count,
-        "axis_length_m": float(total_len),
-        "total_volume_m3": float(total_volume),
-    }
+    return rows, float(total_volume), float(total_len), int(count)
