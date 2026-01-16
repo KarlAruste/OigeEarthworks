@@ -2,6 +2,7 @@
 import os
 from contextlib import contextmanager
 from datetime import date
+
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
@@ -26,6 +27,8 @@ def init_db():
     """
     Create all tables if they don't exist.
     Safe to run on every app start.
+
+    Includes small migrations for older schemas (e.g. task_deps.dep_id -> dep_task_id).
     """
     with get_conn() as conn:
         cur = conn.cursor()
@@ -105,6 +108,68 @@ def init_db():
             );
             """
         )
+
+        # -----------------------------
+        # MIGRATION: older task_deps schemas
+        # - dep_id -> dep_task_id
+        # -----------------------------
+        cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name='task_deps';
+            """
+        )
+        cols = {r["column_name"] for r in cur.fetchall()}
+
+        if "dep_task_id" not in cols:
+            if "dep_id" in cols:
+                cur.execute("""ALTER TABLE task_deps RENAME COLUMN dep_id TO dep_task_id;""")
+            else:
+                cur.execute("""ALTER TABLE task_deps ADD COLUMN dep_task_id INTEGER NULL;""")
+
+            # Ensure FK exists (ignore if it already exists)
+            cur.execute(
+                """
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conname = 'task_deps_dep_task_id_fkey'
+                    ) THEN
+                        ALTER TABLE task_deps
+                        ADD CONSTRAINT task_deps_dep_task_id_fkey
+                        FOREIGN KEY (dep_task_id) REFERENCES tasks(id) ON DELETE CASCADE;
+                    END IF;
+                END$$;
+                """
+            )
+
+            # Ensure PK exists on (task_id, dep_task_id).
+            # If there are NULL dep_task_id rows (possible only if we added the column),
+            # PK cannot be created until data fixed.
+            cur.execute(
+                """
+                DO $$
+                DECLARE pkname text;
+                BEGIN
+                    SELECT conname INTO pkname
+                    FROM pg_constraint
+                    WHERE conrelid = 'task_deps'::regclass
+                      AND contype = 'p'
+                    LIMIT 1;
+
+                    IF pkname IS NOT NULL THEN
+                        EXECUTE format('ALTER TABLE task_deps DROP CONSTRAINT %I;', pkname);
+                    END IF;
+
+                    IF NOT EXISTS (SELECT 1 FROM task_deps WHERE dep_task_id IS NULL) THEN
+                        ALTER TABLE task_deps
+                        ADD CONSTRAINT task_deps_pkey PRIMARY KEY (task_id, dep_task_id);
+                    END IF;
+                END$$;
+                """
+            )
 
         # Cost items
         cur.execute(
@@ -197,10 +262,13 @@ def set_project_top_width(project_id: int, landxml_key: str, top_width_m: float 
         conn.commit()
 
 
-def set_project_landxml(project_id: int, landxml_key: str,
-                        planned_volume_m3: float | None,
-                        planned_length_m: float | None,
-                        planned_area_m2: float | None):
+def set_project_landxml(
+    project_id: int,
+    landxml_key: str,
+    planned_volume_m3: float | None,
+    planned_length_m: float | None,
+    planned_area_m2: float | None
+):
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
