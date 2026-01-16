@@ -1,4 +1,3 @@
-# views/tasks_view.py
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -7,11 +6,12 @@ from db import (
     list_projects,
     add_task,
     list_tasks,
-    list_task_deps_by_project,   # <-- NEW
+    list_task_deps_by_project,
     set_task_deps,
     set_task_status,
     delete_task,
 )
+
 
 def _render_tasks_gantt_with_deps(tasks: list[dict], deps_rows: list[dict]):
     st.subheader("📊 Ajakava (Gantt + eeldused)")
@@ -22,11 +22,9 @@ def _render_tasks_gantt_with_deps(tasks: list[dict], deps_rows: list[dict]):
 
     df = pd.DataFrame(tasks).copy()
 
-    # parse dates
     df["start_date"] = pd.to_datetime(df.get("start_date"), errors="coerce")
     df["end_date"] = pd.to_datetime(df.get("end_date"), errors="coerce")
 
-    # only tasks with both dates can be drawn on gantt
     have_dates = df["start_date"].notna() & df["end_date"].notna()
     dfg = df.loc[have_dates].copy()
     missing = df.loc[~have_dates].copy()
@@ -36,17 +34,15 @@ def _render_tasks_gantt_with_deps(tasks: list[dict], deps_rows: list[dict]):
         if not missing.empty:
             st.caption("Tööd, millel kuupäevad puuduvad:")
             for _, r in missing.iterrows():
-                st.write(f"• {r.get('name','(nimetu)')} — start: {r.get('start_date')} end: {r.get('end_date')}")
+                st.write(f"• {r.get('name','(nimetu)')}")
         return
 
-    # Validate end >= start
     bad = dfg["end_date"] < dfg["start_date"]
     if bad.any():
         st.error("Mõnel tööl on Lõpp enne Algust. Paranda kuupäevad.")
         st.dataframe(dfg.loc[bad, ["name", "start_date", "end_date"]], use_container_width=True)
         return
 
-    # Stable order (same as current list order)
     dfg["label"] = dfg["name"].astype(str)
     category_order = list(dfg["label"].values)
 
@@ -71,10 +67,7 @@ def _render_tasks_gantt_with_deps(tasks: list[dict], deps_rows: list[dict]):
         legend_title="Staatus",
     )
 
-    # -----------------------------
-    # Draw dependency arrows
-    # -----------------------------
-    # Build lookup by task_id for dates + label
+    # dependency arrows: dep end -> task start
     by_id = {}
     for _, r in dfg.iterrows():
         by_id[int(r["id"])] = {
@@ -83,7 +76,6 @@ def _render_tasks_gantt_with_deps(tasks: list[dict], deps_rows: list[dict]):
             "end": r["end_date"],
         }
 
-    # Add arrows: dep end -> task start
     arrow_count = 0
     for row in (deps_rows or []):
         try:
@@ -93,22 +85,14 @@ def _render_tasks_gantt_with_deps(tasks: list[dict], deps_rows: list[dict]):
             continue
 
         if task_id not in by_id or dep_id not in by_id:
-            # If either task has missing dates, we skip
             continue
 
         t = by_id[task_id]
         d = by_id[dep_id]
 
-        # Arrow from dependency END to task START
-        x0 = d["end"]
-        x1 = t["start"]
-        y0 = d["label"]
-        y1 = t["label"]
-
-        # If somehow x1 is before x0, still draw (it highlights schedule issue)
         fig.add_annotation(
-            x=x1, y=y1,
-            ax=x0, ay=y0,
+            x=t["start"], y=t["label"],
+            ax=d["end"], ay=d["label"],
             xref="x", yref="y",
             axref="x", ayref="y",
             showarrow=True,
@@ -120,7 +104,7 @@ def _render_tasks_gantt_with_deps(tasks: list[dict], deps_rows: list[dict]):
         arrow_count += 1
 
     if arrow_count == 0:
-        st.caption("Eelduste nooli ei kuvata (kas pole eeldusi või kuupäevad puuduvad).")
+        st.caption("Eelduste nooli ei kuvata (pole eeldusi või kuupäevad puuduvad).")
 
     st.plotly_chart(fig, use_container_width=True)
 
@@ -133,13 +117,13 @@ def render_tasks_view():
         st.info("Loo enne projekt (Projects lehel).")
         return
 
-    # pick project
     project_id = st.selectbox(
         "Vali projekt",
         options=[p["id"] for p in projects],
         format_func=lambda pid: next(x["name"] for x in projects if x["id"] == pid),
     )
 
+    # --- Add task ---
     st.markdown('<div class="block">', unsafe_allow_html=True)
     st.subheader("➕ Lisa töö")
 
@@ -170,12 +154,12 @@ def render_tasks_view():
 
     deps_rows = list_task_deps_by_project(project_id)
 
-    # Gantt + dependencies
+    # --- Gantt + deps ---
     st.markdown('<div class="block">', unsafe_allow_html=True)
     _render_tasks_gantt_with_deps(tasks, deps_rows)
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # Dependencies editor
+    # --- Dependencies editor ---
     st.markdown('<div class="block">', unsafe_allow_html=True)
     st.subheader("🔗 Eeldustööd")
 
@@ -199,22 +183,17 @@ def render_tasks_view():
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # Task list
+    # --- Task list ---
     st.subheader("📋 Tööd (ainult see projekt)")
 
     for t in tasks:
         blocked = t["blocked"] and t["status"] != "done"
         tag = "🔴 BLOKEERITUD" if blocked else "🟢 OK"
-
-        extra = ""
-        if blocked:
-            extra = f" (puudub {t.get('missing_deps', 0)} eeldust)"
+        extra = f" (puudub {t.get('missing_deps', 0)} eeldust)" if blocked else ""
 
         sd = t.get("start_date")
         ed = t.get("end_date")
-        dates_txt = ""
-        if sd or ed:
-            dates_txt = f" • {sd or '-'} → {ed or '-'}"
+        dates_txt = f" • {sd or '-'} → {ed or '-'}" if (sd or ed) else ""
 
         st.write(f"**{t['name']}** • {t['status']}{dates_txt} • {tag}{extra}")
 
