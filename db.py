@@ -368,6 +368,26 @@ def set_task_deps(task_id: int, dep_ids: list[int]):
         conn.commit()
 
 
+def list_task_deps_by_project(project_id: int):
+    """
+    Tagastab kõik sõltuvused antud projekti sees.
+    Output: list[dict] kus igal real on {task_id, dep_task_id}
+    """
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT d.task_id, d.dep_task_id
+            FROM task_deps d
+            JOIN tasks t ON t.id = d.task_id
+            WHERE t.project_id = %s
+            ORDER BY d.task_id, d.dep_task_id;
+            """,
+            (project_id,),
+        )
+        return cur.fetchall()
+
+
 def _missing_deps_count(cur, task_id: int) -> int:
     cur.execute(
         """
