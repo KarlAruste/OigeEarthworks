@@ -1,32 +1,62 @@
 import streamlit as st
 
 from db import init_db
-from views.tasks_view import render_tasks_view
 
-# Kui sul on muud view-d, impordi need ka:
-# from views.projects_view import render_projects_view
-# from views.workers_view import render_workers_view
-# from views.machines_view import render_machines_view
-# from views.reports_view import render_reports_view
+from views.projects_view import render_projects_view
+from views.workers_view import render_workers_view
+from views.machines_view import render_machines_view
+from views.reports_view import render_reports_view
+from views.tasks_view import render_tasks_view
 
 
 def inject_global_ui_css():
     st.markdown(
         """
         <style>
-        /* ========= Global readable dark UI ========= */
+        /* =========================
+           FORCE DARK APP THEME
+           ========================= */
 
-        /* General text */
+        /* Whole app background */
+        .stApp {
+            background: #060b14 !important;
+            color: rgba(229,231,235,0.92) !important;
+        }
+
+        /* Main content background */
+        section.main > div {
+            background: #060b14 !important;
+        }
+
+        /* Top header bar */
+        header[data-testid="stHeader"] {
+            background: #060b14 !important;
+        }
+
+        /* Sidebar background */
+        section[data-testid="stSidebar"] {
+            background: #050a12 !important;
+            border-right: 1px solid rgba(255,255,255,0.08) !important;
+        }
+        section[data-testid="stSidebar"] > div {
+            background: #050a12 !important;
+        }
+
+        /* Make all text readable */
         html, body, [class*="css"]  {
-            color: rgba(229,231,235,0.92);
+            color: rgba(229,231,235,0.92) !important;
         }
 
         /* Labels */
         label, .stMarkdown, .stCaption {
-          color: rgba(229,231,235,0.92) !important;
+            color: rgba(229,231,235,0.92) !important;
         }
 
-        /* Inputs (text/date/number/textarea) */
+        /* =========================
+           INPUTS + SELECTS READABLE
+           ========================= */
+
+        /* Inputs (text/date/number) */
         div[data-baseweb="input"] input,
         div[data-baseweb="textarea"] textarea {
             background-color: #0f172a !important;
@@ -67,7 +97,7 @@ def inject_global_ui_css():
             background-color: rgba(255,255,255,0.08) !important;
         }
 
-        /* Multiselect chips/tags */
+        /* Multiselect tags */
         div[data-baseweb="tag"] {
             background-color: rgba(255,255,255,0.10) !important;
             color: #e5e7eb !important;
@@ -87,7 +117,7 @@ def inject_global_ui_css():
             border-color: rgba(255,165,0,0.65) !important;
         }
 
-        /* Buttons (optional: unify with your orange) */
+        /* Buttons nicer */
         .stButton > button {
             border-radius: 10px !important;
         }
@@ -100,30 +130,32 @@ def inject_global_ui_css():
 
 def main():
     st.set_page_config(page_title="Earthworks", layout="wide")
-    inject_global_ui_css()
 
-    # DB init + migrations (important!)
+    # DB init + migrations
     init_db()
+
+    # CSS (after page config, before UI)
+    inject_global_ui_css()
 
     st.sidebar.title("Earthworks")
     st.sidebar.caption("Kaevetööd • Ressursid • Aruanded")
 
     page = st.sidebar.radio(
         "Menüü",
-        ["Tasks"],  # lisa siia teised kui sul olemas: "Projects", "Workers", "Machines", "Reports"
-        index=0,
+        ["Projects", "Workers", "Tasks", "Machines", "Reports"],
+        index=2,  # default Tasks
     )
 
-    if page == "Tasks":
+    if page == "Projects":
+        render_projects_view()
+    elif page == "Workers":
+        render_workers_view()
+    elif page == "Tasks":
         render_tasks_view()
-    # elif page == "Projects":
-    #     render_projects_view()
-    # elif page == "Workers":
-    #     render_workers_view()
-    # elif page == "Machines":
-    #     render_machines_view()
-    # elif page == "Reports":
-    #     render_reports_view()
+    elif page == "Machines":
+        render_machines_view()
+    elif page == "Reports":
+        render_reports_view()
 
 
 if __name__ == "__main__":
