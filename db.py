@@ -1,4 +1,3 @@
-# db.py
 import os
 from contextlib import contextmanager
 from datetime import date
@@ -28,7 +27,8 @@ def init_db():
     Create all tables if they don't exist.
     Safe to run on every app start.
 
-    Includes small migrations for older schemas (e.g. task_deps.dep_id -> dep_task_id).
+    Includes migrations:
+      - task_deps.dep_id -> dep_task_id (older schema)
     """
     with get_conn() as conn:
         cur = conn.cursor()
@@ -68,7 +68,7 @@ def init_db():
             """
         )
 
-        # Assignments (worker booking)
+        # Assignments
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS assignments (
@@ -98,7 +98,7 @@ def init_db():
             """
         )
 
-        # Task dependencies
+        # Task dependencies (new schema)
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS task_deps (
@@ -128,7 +128,7 @@ def init_db():
             else:
                 cur.execute("""ALTER TABLE task_deps ADD COLUMN dep_task_id INTEGER NULL;""")
 
-            # Ensure FK exists (ignore if it already exists)
+            # Ensure FK exists (ignore if exists)
             cur.execute(
                 """
                 DO $$
@@ -145,9 +145,7 @@ def init_db():
                 """
             )
 
-            # Ensure PK exists on (task_id, dep_task_id).
-            # If there are NULL dep_task_id rows (possible only if we added the column),
-            # PK cannot be created until data fixed.
+            # Ensure PK exists (only if no NULLs)
             cur.execute(
                 """
                 DO $$
@@ -238,14 +236,14 @@ def list_projects():
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute("SELECT * FROM projects ORDER BY id DESC;")
-        return cur.fetchall()  # list[dict]
+        return cur.fetchall()
 
 
 def get_project(project_id: int):
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute("SELECT * FROM projects WHERE id=%s;", (project_id,))
-        return cur.fetchone()  # dict
+        return cur.fetchone()
 
 
 def set_project_top_width(project_id: int, landxml_key: str, top_width_m: float | None):
@@ -262,13 +260,10 @@ def set_project_top_width(project_id: int, landxml_key: str, top_width_m: float 
         conn.commit()
 
 
-def set_project_landxml(
-    project_id: int,
-    landxml_key: str,
-    planned_volume_m3: float | None,
-    planned_length_m: float | None,
-    planned_area_m2: float | None
-):
+def set_project_landxml(project_id: int, landxml_key: str,
+                        planned_volume_m3: float | None,
+                        planned_length_m: float | None,
+                        planned_area_m2: float | None):
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
@@ -330,7 +325,6 @@ def add_assignment(worker_id: int, project_id: int, start: date, end: date, note
     with get_conn() as conn:
         cur = conn.cursor()
 
-        # conflict check: same worker overlapping date range
         cur.execute(
             """
             SELECT COUNT(*) AS c
@@ -437,10 +431,6 @@ def set_task_deps(task_id: int, dep_ids: list[int]):
 
 
 def list_task_deps_by_project(project_id: int):
-    """
-    Tagastab kõik sõltuvused antud projekti sees.
-    Output: list[dict] kus igal real on {task_id, dep_task_id}
-    """
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
